@@ -664,7 +664,7 @@ def evaluate_rge_multiclass_tabular(
     n_steps=None,
     random_seed=None,
     verbose=True,
-    plot=True,
+    plot=False,
     fig_size=(10, 6),
     save_path=None,
     prob_full_cached=None,
@@ -784,10 +784,9 @@ def evaluate_rge_multiclass_tabular(
     if plot:
         plt.figure(figsize=fig_size)
         plt.plot(removal_fractions * 100, rge_rescaled, '-o', linewidth=2.5, markersize=6)
-        plt.fill_between(removal_fractions * 100, 0, rge_rescaled, alpha=0.2)
         plt.xlabel('Removed Features (%)', fontsize=11, fontweight='bold')
         plt.ylabel('RGE Score', fontsize=11, fontweight='bold')
-        plt.title(f'RGE Curve: {model_name} ({masking_method})', fontsize=12, fontweight='bold')
+        plt.title(f'RGE Curve: {model_name}', fontsize=12, fontweight='bold')
         plt.grid(alpha=0.3, linestyle='--')
         plt.tight_layout()
         if save_path is None:
