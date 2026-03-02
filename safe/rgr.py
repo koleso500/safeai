@@ -75,7 +75,6 @@ def rgr_cramer_multiclass(prob_original, prob_perturbed, class_order=None, class
             f'Shape mismatch: prob_original {prob_original.shape} and prob_perturbed {prob_perturbed.shape}'
         )
 
-    # Set up class weights
     if class_weights is None:
         class_weights = np.ones(n_classes) / n_classes
     else:
@@ -165,21 +164,17 @@ def evaluate_rgr_multiclass_noise(model, x_data, prob_original, noise_levels,
     model_class_order = np.asarray(model_class_order)
     class_order = np.asarray(class_order)
 
-    # Set random seed for reproducibility
     rng = np.random.default_rng(random_seed)
 
-    # Align prob_original to target class_order at start
     prob_original_aligned = align_proba_to_class_order(
         prob_original, model_class_order, class_order
     )
 
     n_samples, n_classes = prob_original_aligned.shape
 
-    # Set up class weights
     if class_weights is None:
         class_weights = np.ones(n_classes) / n_classes
 
-    # Convert PyTorch tensor once if needed
     if model_type == 'pytorch':
         if not isinstance(x_data, torch.Tensor):
             x_data = torch.tensor(x_data, dtype=torch.float32)
@@ -206,7 +201,6 @@ def evaluate_rgr_multiclass_noise(model, x_data, prob_original, noise_levels,
             )
 
         elif model_type == 'pytorch':
-            # Add Gaussian noise to tensor
             noise = torch.randn_like(x_data) * sigma
             x_noisy = x_data + noise
 
@@ -239,23 +233,19 @@ def evaluate_rgr_multiclass_noise(model, x_data, prob_original, noise_levels,
     rgr_scores = np.array(rgr_scores)
     per_class_rgr_list = np.array(per_class_rgr_list)
 
-    # Rescale by full RGA if provided
     if rga_full is not None:
         rgr_rescaled = rgr_scores * rga_full
     else:
         rgr_rescaled = rgr_scores
 
-    # Normalize noise for AUC calculation
     max_noise = np.max(noise_levels)
     noise_norm = noise_levels / max_noise if max_noise > 0 else noise_levels
 
-    # Calculate AURGR
     aurgr = auc(noise_norm, rgr_rescaled)
 
     if verbose:
         print(f'AURGR: {aurgr:.4f}')
 
-    # Visualization
     if plot:
         plt.figure(figsize=fig_size)
         plt.plot(noise_levels * 100, rgr_rescaled, '-o', linewidth=2.5,

@@ -401,7 +401,7 @@ def evaluate_rga_multiclass(y_labels, prob_matrix, class_order=None, n_segments=
     if verbose:
         print(f"RGA Evaluation: {model_name}")
         print(f"Full RGA: {rga_full:.4f}")
-        print(f"AURGA (new): {aurga_model:.4f}")
+        print(f"AURGA: {aurga_model:.4f}")
         print(f"AURGA_perfect: {aurga_perfect:.4f}")
         print(f"AURGA_normalized_to_perfect: {aurga_norm:.4f}")
         print(f"\nClass order: {classes_used}")

@@ -414,9 +414,7 @@ def evaluate_rge_multiclass_text(
         model, x, removal_fractions, model_class_order, class_order,
         model_type='sklearn', device=None, batch_size=256,
         class_weights=None, model_name='Model', rga_full=None,
-        masking_method='random',           # 'random' | 'most_important'
-        feature_ranking=None,              # required for 'most_important' (array of feature indices, sorted desc)
-        baseline='zero',                   # 'zero' | 'mean'
+        masking_method='random', feature_ranking=None, baseline='zero',
         plot=True, fig_size=(10, 6), verbose=True, random_seed=None, save_path=None, prob_full_cached=None
 ):
     """
@@ -441,18 +439,16 @@ def evaluate_rge_multiclass_text(
         raise ValueError(f"Unknown baseline: {baseline}. Use 'zero' or 'mean'.")
 
     if verbose:
-        print(f'RGE (Text Feature Removal): {model_name}')
+        print(f'RGE: {model_name}')
         print(f'Masking: {masking_method} | Baseline: {baseline}')
         print(f'x: {x.shape} | Testing {len(removal_fractions)} removal fractions')
 
     rng = np.random.RandomState(random_seed if random_seed is not None else 42)
 
-    # Baseline feature values for "mean" replacement
     feat_mean = None
     if baseline == 'mean':
         feat_mean = np.nanmean(x, axis=0)
 
-    # Baseline predictions (full, unmasked)
     if prob_full_cached is None:
         prob_full = get_predictions_from_features(
             x, model, model_class_order, class_order,
@@ -474,7 +470,6 @@ def evaluate_rge_multiclass_text(
         if verbose:
             print(f'\nRemoval level: {frac * 100:.0f}% | masking {k}/{n_features} features')
 
-        # Prepare masked X
         x_masked = x.copy()
 
         if k > 0:
@@ -490,7 +485,6 @@ def evaluate_rge_multiclass_text(
             else:  # baseline == 'mean'
                 x_masked[:, cols] = feat_mean[cols]
 
-        # Reduced predictions
         prob_reduced = get_predictions_from_features(
             x_masked, model, model_class_order, class_order,
             model_type=model_type, device=device, batch_size=batch_size
@@ -510,10 +504,8 @@ def evaluate_rge_multiclass_text(
     rge_scores = np.asarray(rge_scores, dtype=float)
     per_class_rge_list = np.asarray(per_class_rge_list)
 
-    # Rescale by RGA
     rge_rescaled = rge_scores * float(rga_full) if (rga_full is not None and np.isfinite(rga_full)) else rge_scores
 
-    # AUC on normalized x-axis
     max_frac = float(np.max(removal_fractions)) if len(removal_fractions) else 1.0
     x = removal_fractions / max_frac if max_frac > 0 else removal_fractions
     aurge = auc(x, rge_rescaled)
@@ -527,7 +519,7 @@ def evaluate_rge_multiclass_text(
         plt.fill_between(removal_fractions * 100, 0, rge_rescaled, alpha=0.2)
         plt.xlabel('Removed Features (%)', fontsize=11, fontweight='bold')
         plt.ylabel('RGE Score', fontsize=11, fontweight='bold')
-        plt.title(f'RGE Curve (Text): {model_name} ({masking_method})', fontsize=12, fontweight='bold')
+        plt.title(f'RGE Curve: {model_name} ({masking_method})', fontsize=12, fontweight='bold')
         plt.grid(alpha=0.3, linestyle='--')
         plt.tight_layout()
         if save_path is None:
@@ -564,10 +556,10 @@ def compare_models_rge_text(
         feature_rankings=None,
 ):
     """
-    Evaluate and plot RGE curves for multiple models on TEXT feature matrices.
+    Evaluate and plot RGE curves for multiple models on text feature matrices.
 
-    Expected models_dict format (same as you used in main text code):
-        model_name -> (model, X, prob_full, class_order, model_type, device)
+    Expected models_dict format:
+        model_name -> (model, x, prob_full, class_order, model_type, device)
 
     Notes
     -----
@@ -599,7 +591,7 @@ def compare_models_rge_text(
         model, x, prob_full, model_class_order, model_type, device = tpl
 
         if verbose:
-            print(f'\nEvaluating RGE (text) for {name}')
+            print(f'\nEvaluating RGE for {name}')
 
         res = evaluate_rge_multiclass_text(
             model=model,
@@ -672,6 +664,9 @@ def evaluate_rge_multiclass_tabular(
     n_steps=None,
     random_seed=None,
     verbose=True,
+    plot=True,
+    fig_size=(10, 6),
+    save_path=None,
     prob_full_cached=None,
 ):
     x = np.asarray(x, dtype=float)
@@ -694,7 +689,6 @@ def evaluate_rge_multiclass_tabular(
     removed = []
     remaining = list(range(n_features))
 
-    # step_rge[0]=1.0 like your old code
     rge_scores = [1.0]
     per_class_rge_list = []
 
@@ -782,6 +776,26 @@ def evaluate_rge_multiclass_tabular(
     rge_rescaled = rge_scores * float(rga_full) if (rga_full is not None and np.isfinite(rga_full)) else rge_scores
     aurge = auc(x_axis, rge_rescaled)
 
+    removal_fractions = np.linspace(0, 1, n_steps + 1)
+
+    if verbose:
+        print(f'AURGE: {aurge:.4f}')
+
+    if plot:
+        plt.figure(figsize=fig_size)
+        plt.plot(removal_fractions * 100, rge_rescaled, '-o', linewidth=2.5, markersize=6)
+        plt.fill_between(removal_fractions * 100, 0, rge_rescaled, alpha=0.2)
+        plt.xlabel('Removed Features (%)', fontsize=11, fontweight='bold')
+        plt.ylabel('RGE Score', fontsize=11, fontweight='bold')
+        plt.title(f'RGE Curve: {model_name} ({masking_method})', fontsize=12, fontweight='bold')
+        plt.grid(alpha=0.3, linestyle='--')
+        plt.tight_layout()
+        if save_path is None:
+            plt.show()
+        else:
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.close()
+
     return {
         "x_axis": x_axis,
         "rge_scores": rge_scores,
@@ -800,7 +814,7 @@ def compare_models_rge_tabular(
     class_order,
     class_weights=None,
     rga_dict=None,
-    masking_method='greedy',      # 'greedy'|'random'|'most_important'
+    masking_method='greedy', # 'greedy'|'random'|'most_important'
     baseline='zero',
     n_steps=None,
     verbose=True,
@@ -814,7 +828,7 @@ def compare_models_rge_tabular(
       model_name -> (model, x, feature_names, prob_full, model_class_order, model_type, device)
 
     - prob_full can be None; if provided it should already be aligned to class_order.
-    - feature_rankings: optional ranking(s) for 'most_important'
+    - feature_rankings: optional ranking for 'most_important'
     """
     results = {}
 
@@ -869,7 +883,7 @@ def compare_models_rge_tabular(
             linewidth=2.2,
             markersize=5,
             color=col,
-            label=f"{name} ({res['masking_method']}, AURGE={res['aurge']:.3f})",
+            label=f"{name} (AURGE={res['aurge']:.3f})",
         )
 
     plt.xlabel("Fraction of Features Removed", fontsize=11, fontweight="bold")
