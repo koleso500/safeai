@@ -900,6 +900,6 @@ def compare_models_rge_tabular(
     if verbose:
         print("\nExplainability Comparison Summary (AURGE)")
         for name in results:
-            print(f"{name:15s}: AURGE={results[name]['aurge']:.4f}")
+            print(f"{name}: AURGE={results[name]['aurge']:.4f}")
 
     return results
