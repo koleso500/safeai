@@ -51,7 +51,7 @@ def concordance_curve(y, yhat):
     if len(y) == 0:
         return np.array([])
 
-    ord_idx = np.argsort(yhat)
+    ord_idx = np.argsort(yhat, kind='stable')
     cum = np.cumsum(y[ord_idx])
     return cum / cum[-1]
 
@@ -106,11 +106,11 @@ def cvm1_concordance_weighted(y, yhat):
         return np.nan
 
     # Lorenz curve
-    ord_y = np.argsort(y)
+    ord_y = np.argsort(y, kind='stable')
     l = np.cumsum(y[ord_y]) / np.sum(y)
 
     # Concordance curve
-    ord_yhat = np.argsort(yhat)
+    ord_yhat = np.argsort(yhat, kind='stable')
     c = np.cumsum(y[ord_yhat]) / np.sum(y)
 
     # Weights
