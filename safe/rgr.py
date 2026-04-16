@@ -1,8 +1,12 @@
 import numpy as np
 import matplotlib.pyplot as plt
 import torch
+import torch.nn as nn
 
+from art.attacks.evasion import FastGradientMethod, ProjectedGradientDescent
+from art.estimators.classification import PyTorchClassifier, SklearnClassifier
 from sklearn.metrics import auc
+from typing import Literal
 from safe.cramer import gini_via_lorenz, cvm1_concordance_weighted
 from safe.utils import align_proba_to_class_order, ensure_prob_matrix
 
@@ -392,3 +396,267 @@ def compare_models_rgr(models_dict, noise_levels, class_order,
             print(f'Worst: {model_names[worst_idx]} (AURGR={worst:.4f})')
 
     return results
+
+
+def _bound_values(x_data):
+    """
+    Estimate the minimum and maximum values in the dataset for ART
+    """
+    x_np = x_data.detach().cpu().numpy() if isinstance(x_data, torch.Tensor) else np.asarray(x_data)
+    x_min = float(np.min(x_np))
+    x_max = float(np.max(x_np))
+    if not np.isfinite(x_min) or not np.isfinite(x_max):
+        raise ValueError('Invalid values in x_data')
+    if x_min == x_max:
+        x_max = x_min + 1e-6
+    bounds = (x_min, x_max)
+    return bounds
+
+
+def _art_classifier(
+    model,
+    x_data,
+    nb_classes,
+    model_type='sklearn',
+    device=None,
+    clip_values=None,
+):
+    """
+    ART classifier
+    """
+    if clip_values is None:
+        clip_values = _bound_values(x_data)
+
+    if model_type == 'sklearn':
+        return SklearnClassifier(model=model, clip_values=clip_values)
+
+    if model_type == 'pytorch':
+        if not isinstance(x_data, torch.Tensor):
+            x_data = torch.tensor(x_data, dtype=torch.float32)
+
+        input_shape = tuple(x_data.shape[1:])
+        loss = nn.CrossEntropyLoss()
+
+        device_type = 'gpu' if (
+            device is not None and str(device).startswith('cuda') and torch.cuda.is_available()
+        ) else 'cpu'
+
+        return PyTorchClassifier(
+            model=model,
+            loss=loss,
+            input_shape=input_shape,
+            nb_classes=nb_classes,
+            optimizer=None,
+            clip_values=clip_values,
+            device_type=device_type,
+        )
+
+    raise ValueError(f'Unsupported model_type: {model_type}')
+
+
+def generate_adversarial_examples(
+    model,
+    x_data,
+    y_labels,
+    nb_classes,
+    attack_name: Literal['fgsm', 'pgd'] = 'fgsm',
+    attack_params=None,
+    model_type='sklearn',
+    device=None,
+    clip_values=None,
+):
+    """
+    Generate adversarial examples with ART
+
+    Parameters
+    ----------
+    model :
+        Trained model
+    x_data :
+        Input features
+    y_labels :
+        Integer class labels
+    nb_classes : int
+        Number of classes
+    attack_name : {'fgsm', 'pgd'}
+        Attack type
+    attack_params : dict, optional
+        ART attack parameters
+    model_type : {'sklearn', 'pytorch'}
+        Model type
+    device :
+        Torch device for pytorch models
+    clip_values : tuple, optional
+        (min, max) bounds for ART
+
+    Returns
+    -------
+    np.ndarray
+        Adversarial samples
+    """
+    if attack_params is None:
+        attack_params = {}
+
+    x_np = x_data.detach().cpu().numpy() if isinstance(x_data, torch.Tensor) else np.asarray(x_data)
+    y_np = np.asarray(y_labels).astype(int)
+
+    classifier = _art_classifier(
+        model=model,
+        x_data=x_np,
+        nb_classes=nb_classes,
+        model_type=model_type,
+        device=device,
+        clip_values=clip_values,
+    )
+
+    if attack_name == 'fgsm':
+        attack = FastGradientMethod(estimator=classifier, **attack_params)
+    elif attack_name == 'pgd':
+        attack = ProjectedGradientDescent(estimator=classifier, **attack_params)
+    else:
+        raise ValueError(f'Unsupported attack_name: {attack_name}')
+
+    x_adv = attack.generate(x=x_np, y=y_np)
+    return np.asarray(x_adv, dtype=np.float32)
+
+
+def evaluate_rgr_multiclass_adversarial(
+    model,
+    x_data,
+    prob_original,
+    attack_strengths,
+    model_class_order,
+    class_order,
+    y_true,
+    attack_name: Literal['fgsm', 'pgd'] = 'fgsm',
+    base_attack_params=None,
+    class_weights=None,
+    model_type='sklearn',
+    device=None,
+    rga_full=None,
+    model_name='Model',
+    plot=True,
+    fig_size=(10, 6),
+    verbose=True,
+    save_path=None,
+):
+    """
+    Evaluate RGR robustness under adversarial perturbations
+    """
+    prob_original = np.asarray(prob_original)
+    attack_strengths = np.asarray(attack_strengths, dtype=float)
+    model_class_order = np.asarray(model_class_order)
+    class_order = np.asarray(class_order)
+    y_true = np.asarray(y_true).astype(int)
+
+    prob_original_aligned = align_proba_to_class_order(
+        prob_original, model_class_order, class_order
+    )
+    n_samples, n_classes = prob_original_aligned.shape
+
+    if class_weights is None:
+        class_weights = np.ones(n_classes) / n_classes
+
+    adv_rgr_scores = []
+    per_class_rgr_list = []
+
+    if verbose:
+        print(f'Adversarial RGR Evaluation: {model_name}')
+        print(f'Attack: {attack_name}')
+        print(f'Testing {len(attack_strengths)} attack strengths')
+
+    for eps in attack_strengths:
+        params = {} if base_attack_params is None else dict(base_attack_params)
+        params['eps'] = float(eps)
+
+        if attack_name == 'pgd' and 'eps_step' not in params:
+            params['eps_step'] = max(float(eps) / 4.0, 1e-4)
+
+        x_adv = generate_adversarial_examples(
+            model=model,
+            x_data=x_data,
+            y_labels=y_true,
+            nb_classes=n_classes,
+            attack_name=attack_name,
+            attack_params=params,
+            model_type=model_type,
+            device=device,
+        )
+
+        if model_type == 'sklearn':
+            prob_perturbed_raw = model.predict_proba(x_adv)
+        elif model_type == 'pytorch':
+            x_adv_tensor = torch.tensor(x_adv, dtype=torch.float32, device=device)
+            with torch.no_grad():
+                logits = model(x_adv_tensor)
+                prob_perturbed_raw = torch.softmax(logits, dim=1).cpu().numpy()
+        else:
+            raise ValueError(f"model_type must be 'sklearn' or 'pytorch', got '{model_type}'")
+
+        prob_perturbed = align_proba_to_class_order(
+            prob_perturbed_raw, model_class_order, class_order
+        )
+
+        rgr_val, rgr_per_class, _ = rgr_cramer_multiclass(
+            prob_original_aligned,
+            prob_perturbed,
+            class_order=class_order,
+            class_weights=class_weights,
+            verbose=False
+        )
+
+        adv_rgr_scores.append(0.0 if np.isnan(rgr_val) else rgr_val)
+        per_class_rgr_list.append(rgr_per_class)
+
+        if verbose:
+            print(f'eps = {eps:.4f}: RGR = {adv_rgr_scores[-1]:.4f}')
+
+    adv_rgr_scores = np.array(adv_rgr_scores)
+    per_class_rgr_list = np.array(per_class_rgr_list)
+
+    if rga_full is not None:
+        rgr_rescaled = adv_rgr_scores * rga_full
+    else:
+        rgr_rescaled = adv_rgr_scores
+
+    max_eps = np.max(attack_strengths)
+    eps_norm = attack_strengths / max_eps if max_eps > 0 else attack_strengths
+    aurgr = auc(eps_norm, rgr_rescaled)
+
+    if verbose:
+        print(f'Adversarial AURGR: {aurgr:.4f}')
+
+    if plot:
+        plt.figure(figsize=fig_size)
+        plt.plot(
+            attack_strengths,
+            rgr_rescaled,
+            '-o',
+            linewidth=2.5,
+            markersize=6,
+            label=f'{model_name} ({attack_name.upper()}, AURGR={aurgr:.3f})'
+        )
+        plt.fill_between(attack_strengths, 0, rgr_rescaled, alpha=0.2)
+        plt.xlabel('Attack strength ε', fontsize=11, fontweight='bold')
+        plt.ylabel('RGR Score', fontsize=11, fontweight='bold')
+        plt.title(f'Adversarial RGR Curve: {model_name}', fontsize=12, fontweight='bold')
+        plt.grid(alpha=0.3, linestyle='--')
+        plt.xlim([0, float(np.max(attack_strengths))])
+        plt.ylim([0, max(rgr_rescaled) * 1.1 if max(rgr_rescaled) > 0 else 1])
+        plt.legend(fontsize=10)
+        plt.tight_layout()
+        if save_path is None:
+            plt.show()
+        else:
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.close()
+
+    return {
+        'attack_name': attack_name,
+        'rgr_scores': adv_rgr_scores,
+        'rgr_rescaled': rgr_rescaled,
+        'aurgr': aurgr,
+        'attack_strengths': attack_strengths,
+        'per_class_rgr': per_class_rgr_list,
+        'class_order': class_order,
+    }
