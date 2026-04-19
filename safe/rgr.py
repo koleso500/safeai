@@ -660,3 +660,105 @@ def evaluate_rgr_multiclass_adversarial(
         'per_class_rgr': per_class_rgr_list,
         'class_order': class_order,
     }
+
+
+def compare_models_rgr_adversarial(
+    models_dict,
+    attack_strengths,
+    class_order,
+    y_true_dict,
+    attack_name: Literal['fgsm', 'pgd'] = 'fgsm',
+    rga_dict=None,
+    class_weights=None,
+    fig_size=(12, 6),
+    verbose=True,
+    save_path=None,
+    base_attack_params=None,
+):
+    """
+    Compare robustness of multiple models under adversarial attacks
+    """
+    results = {}
+
+    for model_name, model_config in models_dict.items():
+        model, x_data, prob_original, model_class_order, model_type, device = model_config
+
+        if model_name not in y_true_dict:
+            raise ValueError(f'Missing true labels for model: {model_name}')
+
+        y_true = y_true_dict[model_name]
+        rga_full = rga_dict.get(model_name) if rga_dict else None
+
+        if verbose:
+            print(f'\nEvaluating {model_name} with {attack_name.upper()}...')
+
+        result = evaluate_rgr_multiclass_adversarial(
+            model=model,
+            x_data=x_data,
+            prob_original=prob_original,
+            attack_strengths=attack_strengths,
+            model_class_order=model_class_order,
+            class_order=class_order,
+            y_true=y_true,
+            attack_name=attack_name,
+            base_attack_params=base_attack_params,
+            class_weights=class_weights,
+            model_type=model_type,
+            device=device,
+            rga_full=rga_full,
+            model_name=model_name,
+            plot=False,
+            verbose=verbose,
+            save_path=save_path,
+        )
+        results[model_name] = result
+
+    model_names = list(results.keys())
+    aurgr_scores = np.array([results[name]['aurgr'] for name in model_names], dtype=float)
+
+    plt.figure(figsize=fig_size)
+    cmap = plt.get_cmap('tab10')
+    colors = cmap(np.linspace(0, 1, len(results)))
+
+    for (model_name, result), color in zip(results.items(), colors):
+        plt.plot(
+            result['attack_strengths'],
+            result['rgr_rescaled'],
+            '-o',
+            linewidth=2.5,
+            markersize=5,
+            color=color,
+            label=f"{model_name} (AURGR={result['aurgr']:.3f})"
+        )
+
+    plt.xlabel('Attack strength ε', fontsize=11, fontweight='bold')
+    plt.ylabel('RGR Score', fontsize=11, fontweight='bold')
+    plt.title(f'Adversarial RGR Curves Comparison ({attack_name.upper()})', fontsize=12, fontweight='bold')
+    plt.grid(alpha=0.3, linestyle='--')
+    plt.xlim([0, float(np.max(attack_strengths))])
+    plt.legend(fontsize=9)
+    plt.tight_layout()
+
+    if save_path is None:
+        plt.show()
+    else:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+
+    plt.close()
+
+    if verbose:
+        print('Adversarial Robustness Comparison Summary')
+        for name, score in zip(model_names, aurgr_scores):
+            print(f'{name}: AURGR = {score:.4f}')
+
+        if len(model_names) >= 2:
+            best_idx = int(np.nanargmax(aurgr_scores))
+            worst_idx = int(np.nanargmin(aurgr_scores))
+
+            best = aurgr_scores[best_idx]
+            worst = aurgr_scores[worst_idx]
+
+            print(f'Best: {model_names[best_idx]} (AURGR={best:.4f})')
+            print(f'Worst: {model_names[worst_idx]} (AURGR={worst:.4f})')
+
+    return results
