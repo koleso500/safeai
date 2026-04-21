@@ -285,13 +285,199 @@ def evaluate_rge_multiclass_occlusion(
         'occlusion_method': occlusion_method,
     }
 
+def _load_all_images(images_dataset, batch_size):
+    loader = DataLoader(images_dataset, batch_size=batch_size, shuffle=False)
+    images_all = []
+    for batch in loader:
+        x = batch[0] if isinstance(batch, (list, tuple)) else batch
+        images_all.append(x)
+    return torch.cat(images_all, dim=0)
+
+
+def _build_occluded_images(images_all, frac, occlusion_method,
+                           patch_size=32, random_seed=None, mask_value=0.0,
+                           patch_rankings=None, patch_meta=None):
+    _, _, h, w = images_all.shape
+    total_pixels = h * w
+    patch_pixels = patch_size * patch_size
+
+    if occlusion_method == 'random':
+        pixels_to_remove = int(frac * total_pixels)
+        num_patches = pixels_to_remove // patch_pixels
+        return apply_patch_occlusion(
+            images_all,
+            num_patches,
+            patch_size,
+            random_seed=random_seed,
+            mask_value=mask_value
+        )
+
+    elif occlusion_method == 'gradcam_most':
+        return apply_importance_masking(
+            images_all,
+            patch_rankings,
+            patch_meta,
+            frac,
+            mask_strategy='most_important',
+            mask_value=mask_value
+        )
+
+    else:
+        raise ValueError(f'Unknown occlusion_method: {occlusion_method}')
+
+
+def _precompute_rge_feature_cache(
+        preprocess_fn,
+        images_dataset,
+        removal_fractions,
+        batch_size=64,
+        occlusion_method='random',
+        patch_size=32,
+        random_seed=None,
+        mask_value=0.0,
+        patch_rankings=None,
+        patch_meta=None,
+        verbose=True,
+):
+    removal_fractions = np.asarray(removal_fractions, dtype=float)
+
+    if occlusion_method in ('gradcam_most', 'gradcam_least'):
+        if patch_rankings is None or patch_meta is None:
+            raise ValueError('For Grad-CAM masking you must pass patch_rankings and patch_meta')
+
+    if verbose:
+        print('Loading images once for shared RGE cache...')
+    images_all = _load_all_images(images_dataset, batch_size=batch_size)
+
+    if verbose:
+        print('Extracting shared features from original images...')
+    feat_full = preprocess_fn(images_all)
+
+    feat_occ_map = {}
+    for frac in removal_fractions:
+        if verbose:
+            print(f'Caching occluded features for {frac * 100:.0f}%')
+
+        images_occ = _build_occluded_images(
+            images_all=images_all,
+            frac=float(frac),
+            occlusion_method=occlusion_method,
+            patch_size=patch_size,
+            random_seed=random_seed,
+            mask_value=mask_value,
+            patch_rankings=patch_rankings,
+            patch_meta=patch_meta,
+        )
+        feat_occ_map[float(frac)] = preprocess_fn(images_occ)
+
+    return {
+        'feat_full': feat_full,
+        'feat_occ_map': feat_occ_map,
+        'removal_fractions': removal_fractions,
+        'occlusion_method': occlusion_method,
+    }
+
+
+def evaluate_rge_multiclass_occlusion_cached(
+        model, feature_cache,
+        model_class_order, class_order,
+        model_type='sklearn', device=None, batch_size=64,
+        class_weights=None, model_name='Model', rga_full=None,
+        plot=True, fig_size=(10, 6), verbose=True, save_path=None
+):
+    removal_fractions = np.asarray(feature_cache['removal_fractions'], dtype=float)
+    feat_full = feature_cache['feat_full']
+    feat_occ_map = feature_cache['feat_occ_map']
+    occlusion_method = feature_cache['occlusion_method']
+
+    if verbose:
+        print(f'RGE Evaluation: {model_name}')
+        print(f'Occlusion: {occlusion_method}')
+        print(f'Testing {len(removal_fractions)} removal fractions')
+        print('Using shared cached features')
+
+    prob_full = get_predictions_from_features(
+        feat_full, model, model_class_order, class_order,
+        model_type=model_type, device=device, batch_size=batch_size
+    )
+
+    rge_scores = []
+    per_class_rge_list = []
+
+    for frac in removal_fractions:
+        if verbose:
+            print(f'\nOcclusion level: {frac * 100:.0f}%')
+
+        feat_occ = feat_occ_map[float(frac)]
+
+        prob_occ = get_predictions_from_features(
+            feat_occ, model, model_class_order, class_order,
+            model_type=model_type, device=device, batch_size=batch_size
+        )
+
+        rge_val, rge_per_class, _ = rge_cramer_multiclass(
+            prob_full,
+            prob_occ,
+            class_order=class_order,
+            class_weights=class_weights
+        )
+        rge_val = 0.0 if np.isnan(rge_val) else float(rge_val)
+
+        rge_scores.append(rge_val)
+        per_class_rge_list.append(rge_per_class)
+
+        if verbose:
+            print(f'RGE = {rge_val:.4f}')
+
+    rge_scores = np.asarray(rge_scores, dtype=float)
+    per_class_rge_list = np.asarray(per_class_rge_list)
+
+    rge_rescaled = (
+        rge_scores * float(rga_full)
+        if (rga_full is not None and np.isfinite(rga_full))
+        else rge_scores
+    )
+
+    max_frac = float(np.max(removal_fractions)) if len(removal_fractions) else 1.0
+    x = removal_fractions / max_frac if max_frac > 0 else removal_fractions
+    aurge = auc(x, rge_rescaled)
+
+    if verbose:
+        print(f'AURGE: {aurge:.4f}')
+
+    if plot:
+        plt.figure(figsize=fig_size)
+        plt.plot(removal_fractions * 100, rge_rescaled, '-o', linewidth=2.5, markersize=6)
+        plt.fill_between(removal_fractions * 100, 0, rge_rescaled, alpha=0.2)
+        plt.xlabel('Occluded Image Area (%)', fontsize=11, fontweight='bold')
+        plt.ylabel('RGE Score', fontsize=11, fontweight='bold')
+        plt.title(f'RGE Curve: {model_name} ({occlusion_method})', fontsize=12, fontweight='bold')
+        plt.grid(alpha=0.3, linestyle='--')
+        plt.tight_layout()
+        if save_path is None:
+            plt.show()
+        else:
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.close()
+
+    return {
+        'rge_scores': rge_scores,
+        'rge_rescaled': rge_rescaled,
+        'aurge': aurge,
+        'removal_fractions': removal_fractions,
+        'per_class_rge': per_class_rge_list,
+        'class_order': class_order,
+        'occlusion_method': occlusion_method,
+    }
+
 
 def compare_models_rge(
         models_dict, images_dataset, removal_fractions, class_order,
         occlusion_method='random',
         patch_size=32, batch_size=64, class_weights=None,
         rga_dict=None, device=None, fig_size=(12, 6), verbose=True,
-        random_seed=None, patch_rankings=None, patch_meta=None, save_path=None
+        random_seed=None, patch_rankings=None, patch_meta=None, save_path=None,
+        mask_value=0.0, use_shared_feature_cache=True
 ):
     """
     Evaluate and plot RGE curves for multiple models.
@@ -345,32 +531,77 @@ def compare_models_rge(
 
     results = {}
 
+    can_share_cache = (
+            use_shared_feature_cache and
+            len(set(methods.values())) == 1
+    )
+
+    shared_cache = None
+    if can_share_cache:
+        first_name = next(iter(models_dict))
+        _, preprocess_fn_first, _, _ = models_dict[first_name]
+        shared_method = methods[first_name]
+
+        shared_cache = _precompute_rge_feature_cache(
+            preprocess_fn=preprocess_fn_first,
+            images_dataset=images_dataset,
+            removal_fractions=removal_fractions,
+            batch_size=batch_size,
+            occlusion_method=shared_method,
+            patch_size=patch_size,
+            random_seed=random_seed,
+            mask_value=mask_value,
+            patch_rankings=patch_rankings,
+            patch_meta=patch_meta,
+            verbose=verbose,
+        )
+
     for name, (model, preprocess_fn, model_class_order, model_type) in models_dict.items():
         if verbose:
             print(f'\nEvaluating {name}')
 
-        res = evaluate_rge_multiclass_occlusion(
-            model=model,
-            preprocess_fn=preprocess_fn,
-            images_dataset=images_dataset,
-            removal_fractions=removal_fractions,
-            model_class_order=model_class_order,
-            class_order=class_order,
-            model_type=model_type,
-            device=device,
-            patch_size=patch_size,
-            batch_size=batch_size,
-            class_weights=class_weights,
-            model_name=name,
-            rga_full=(rga_dict.get(name) if rga_dict else None),
-            occlusion_method=methods.get(name, 'random'),
-            patch_rankings=patch_rankings,
-            patch_meta=patch_meta,
-            plot=False,
-            verbose=verbose,
-            random_seed=random_seed,
-            save_path=save_path
-        )
+        if shared_cache is not None:
+            res = evaluate_rge_multiclass_occlusion_cached(
+                model=model,
+                feature_cache=shared_cache,
+                model_class_order=model_class_order,
+                class_order=class_order,
+                model_type=model_type,
+                device=device,
+                batch_size=batch_size,
+                class_weights=class_weights,
+                model_name=name,
+                rga_full=(rga_dict.get(name) if rga_dict else None),
+                plot=False,
+                fig_size=fig_size,
+                verbose=verbose,
+                save_path=None,
+            )
+        else:
+            res = evaluate_rge_multiclass_occlusion(
+                model=model,
+                preprocess_fn=preprocess_fn,
+                images_dataset=images_dataset,
+                removal_fractions=removal_fractions,
+                model_class_order=model_class_order,
+                class_order=class_order,
+                model_type=model_type,
+                device=device,
+                patch_size=patch_size,
+                batch_size=batch_size,
+                class_weights=class_weights,
+                model_name=name,
+                rga_full=(rga_dict.get(name) if rga_dict else None),
+                occlusion_method=methods.get(name, 'random'),
+                patch_rankings=patch_rankings,
+                patch_meta=patch_meta,
+                plot=False,
+                verbose=verbose,
+                random_seed=random_seed,
+                mask_value=mask_value,
+                save_path=None
+            )
+
         results[name] = res
 
     # Plot comparison.
