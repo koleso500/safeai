@@ -3,7 +3,7 @@ import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 
-from art.attacks.evasion import FastGradientMethod, ProjectedGradientDescent
+from art.attacks.evasion import FastGradientMethod, ProjectedGradientDescent, SquareAttack
 from art.estimators.classification import PyTorchClassifier, SklearnClassifier
 from sklearn.metrics import auc
 from typing import Literal
@@ -111,7 +111,7 @@ def rgr_cramer_multiclass(prob_original, prob_perturbed, class_order=None, class
 def evaluate_rgr_multiclass_noise(model, x_data, prob_original, noise_levels,
                                    model_class_order, class_order,
                                    class_weights=None, model_type='sklearn',
-                                   device=None, rga_full=None, model_name="Model",
+                                   device=None, rga_full=None, model_name='Model',
                                    plot=True, fig_size=(10, 6), verbose=True,
                                    random_seed=None, save_path=None):
     """
@@ -459,7 +459,7 @@ def generate_adversarial_examples(
     x_data,
     y_labels,
     nb_classes,
-    attack_name: Literal['fgsm', 'pgd'] = 'fgsm',
+    attack_name: Literal['fgsm', 'pgd', 'square'] = 'fgsm',
     attack_params=None,
     model_type='sklearn',
     device=None,
@@ -478,7 +478,7 @@ def generate_adversarial_examples(
         Integer class labels
     nb_classes : int
         Number of classes
-    attack_name : {'fgsm', 'pgd'}
+    attack_name : {'fgsm', 'pgd', 'square'}
         Attack type
     attack_params : dict, optional
         ART attack parameters
@@ -513,6 +513,8 @@ def generate_adversarial_examples(
         attack = FastGradientMethod(estimator=classifier, **attack_params)
     elif attack_name == 'pgd':
         attack = ProjectedGradientDescent(estimator=classifier, **attack_params)
+    elif attack_name == 'square':
+        attack = SquareAttack(estimator=classifier, **attack_params)
     else:
         raise ValueError(f'Unsupported attack_name: {attack_name}')
 
@@ -528,7 +530,7 @@ def evaluate_rgr_multiclass_adversarial(
     model_class_order,
     class_order,
     y_true,
-    attack_name: Literal['fgsm', 'pgd'] = 'fgsm',
+    attack_name: Literal['fgsm', 'pgd', 'square'] = 'fgsm',
     base_attack_params=None,
     class_weights=None,
     model_type='sklearn',
@@ -667,7 +669,7 @@ def compare_models_rgr_adversarial(
     attack_strengths,
     class_order,
     y_true_dict,
-    attack_name: Literal['fgsm', 'pgd'] = 'fgsm',
+    attack_name: Literal['fgsm', 'pgd', 'square'] = 'fgsm',
     rga_dict=None,
     class_weights=None,
     fig_size=(12, 6),
