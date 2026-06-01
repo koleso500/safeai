@@ -8,6 +8,12 @@ The package provides implementations of:
 - **RGE** — Rank Graduation Explainability
 - **RGR** — Rank Graduation Robustness
 
+## Installation
+
+```bash
+pip install safe-ai-metrics
+```
+
 ## Acknowledgements
 
 The development of this package builds on the `safeaipackage` project by Golnoosh Babaei.
