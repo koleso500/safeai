@@ -1,0 +1,50 @@
+[build-system]
+requires = ['setuptools>=69', 'wheel']
+build-backend = 'setuptools.build_meta'
+
+[project]
+name = 'safe-ai-metrics'
+version = '0.1.0'
+description = 'SAFE-AI metrics for accuracy, robustness, and explainability evaluation'
+readme = 'README.md'
+requires-python = '>=3.10'
+license = 'MIT'
+authors = [
+    {name = 'Vasily Kolesnikov'}
+]
+keywords = [
+    'safe-ai',
+    'robustness',
+    'explainability',
+    'machine-learning',
+    'metrics',
+    'model-risk',
+    'responsible-ai',
+    'trustworthy-ai'
+]
+classifiers = [
+    'Development Status :: 3 - Alpha',
+    'Programming Language :: Python :: 3',
+    'Programming Language :: Python :: 3.10',
+    'Programming Language :: Python :: 3.11',
+    'Programming Language :: Python :: 3.12',
+    'Intended Audience :: Developers',
+    'Intended Audience :: Science/Research',
+    'Topic :: Scientific/Engineering :: Artificial Intelligence',
+    'Topic :: Scientific/Engineering :: Information Analysis'
+]
+
+dependencies = [
+    'numpy>=1.24',
+    'matplotlib>=3.7',
+    'scikit-learn>=1.3',
+    'torch>=2.0',
+    'torchvision>=0.15',
+    'opencv-python>=4.8',
+    'Pillow>=10',
+    'adversarial-robustness-toolbox>=1.18'
+]
+
+[tool.setuptools.packages.find]
+where = ['.']
+include = ['safeai*']

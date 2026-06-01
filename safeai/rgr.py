@@ -1,14 +1,24 @@
 import numpy as np
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 
-from art.attacks.evasion import FastGradientMethod, ProjectedGradientDescent, SquareAttack
+from art.attacks.evasion import (
+    FastGradientMethod,
+    ProjectedGradientDescent,
+    SquareAttack,
+    HopSkipJump,
+    SimBA,
+    Wasserstein,
+    SpatialTransformation
+)
 from art.estimators.classification import PyTorchClassifier, SklearnClassifier
 from sklearn.metrics import auc
 from typing import Literal
-from safe.cramer import gini_via_lorenz, cvm1_concordance_weighted
-from safe.utils import align_proba_to_class_order, ensure_prob_matrix
+from safeai.cramer import gini_via_lorenz, cvm1_concordance_weighted
+from safeai.utils import align_proba_to_class_order, ensure_prob_matrix
 
 
 def rgr_cramer(pred, pred_pert):
@@ -459,7 +469,7 @@ def generate_adversarial_examples(
     x_data,
     y_labels,
     nb_classes,
-    attack_name: Literal['fgsm', 'pgd', 'square'] = 'fgsm',
+    attack_name: Literal['fgsm', 'pgd', 'square', 'hsj', 'simba'] = 'fgsm',
     attack_params=None,
     model_type='sklearn',
     device=None,
@@ -478,7 +488,7 @@ def generate_adversarial_examples(
         Integer class labels
     nb_classes : int
         Number of classes
-    attack_name : {'fgsm', 'pgd', 'square'}
+    attack_name : {'fgsm', 'pgd', 'square', 'hsj', 'simba'}
         Attack type
     attack_params : dict, optional
         ART attack parameters
@@ -515,6 +525,10 @@ def generate_adversarial_examples(
         attack = ProjectedGradientDescent(estimator=classifier, **attack_params)
     elif attack_name == 'square':
         attack = SquareAttack(estimator=classifier, **attack_params)
+    elif attack_name == 'hsj':
+        attack = HopSkipJump(classifier=classifier, **attack_params)
+    elif attack_name == 'simba':
+        attack = SimBA(classifier=classifier, **attack_params)
     else:
         raise ValueError(f'Unsupported attack_name: {attack_name}')
 
@@ -530,7 +544,7 @@ def evaluate_rgr_multiclass_adversarial(
     model_class_order,
     class_order,
     y_true,
-    attack_name: Literal['fgsm', 'pgd', 'square'] = 'fgsm',
+    attack_name: Literal['fgsm', 'pgd', 'square', 'hsj', 'simba'] = 'fgsm',
     base_attack_params=None,
     class_weights=None,
     model_type='sklearn',
@@ -569,7 +583,15 @@ def evaluate_rgr_multiclass_adversarial(
 
     for eps in attack_strengths:
         params = {} if base_attack_params is None else dict(base_attack_params)
-        params['eps'] = float(eps)
+
+        if attack_name in ['fgsm', 'pgd', 'square']:
+            params['eps'] = float(eps)
+
+        elif attack_name == 'simba':
+            params['epsilon'] = float(eps)
+
+        elif attack_name == 'hsj':
+            params['max_iter'] = int(eps)
 
         if attack_name == 'pgd' and 'eps_step' not in params:
             params['eps_step'] = max(float(eps) / 4.0, 1e-4)
@@ -669,7 +691,7 @@ def compare_models_rgr_adversarial(
     attack_strengths,
     class_order,
     y_true_dict,
-    attack_name: Literal['fgsm', 'pgd', 'square'] = 'fgsm',
+    attack_name: Literal['fgsm', 'pgd', 'square', 'hsj', 'simba'] = 'fgsm',
     rga_dict=None,
     class_weights=None,
     fig_size=(12, 6),
@@ -762,5 +784,397 @@ def compare_models_rgr_adversarial(
 
             print(f'Best: {model_names[best_idx]} (AURGR={best:.4f})')
             print(f'Worst: {model_names[worst_idx]} (AURGR={worst:.4f})')
+
+    return results
+
+
+def compare_models_rgr_wasserstein_images(
+    models_dict,
+    images,
+    y_true,
+    attack_model,
+    preprocess_fn,
+    attack_strengths,
+    class_order,
+    rga_dict=None,
+    class_weights=None,
+    device=None,
+    fig_size=(12, 6),
+    verbose=True,
+    save_path=None,
+    max_iter=50,
+    eps_step=0.01,
+):
+    """
+    Image-level Wasserstein RGR.
+    """
+
+    attack_strengths = np.asarray(attack_strengths, dtype=float)
+    y_true = np.asarray(y_true).astype(int)
+    class_order = np.asarray(class_order)
+
+    if device is None:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    attack_model = attack_model.to(device)
+    attack_model.eval()
+
+    if isinstance(images, torch.Tensor):
+        images_tensor = images.detach().cpu()
+    else:
+        images_tensor = torch.tensor(images, dtype=torch.float32)
+
+    images_01 = torch.clamp((images_tensor + 1.0) / 2.0, 0.0, 1.0)
+
+    class AttackWrapper(nn.Module):
+        def __init__(self, model):
+            super().__init__()
+            self.model = model
+
+        def forward(self, x):
+            x_norm = x * 2.0 - 1.0
+            return self.model(x_norm)
+
+    wrapped_model = AttackWrapper(attack_model).to(device)
+    loss = nn.CrossEntropyLoss()
+
+    classifier = PyTorchClassifier(
+        model=wrapped_model,
+        loss=loss,
+        input_shape=tuple(images_01.shape[1:]),
+        nb_classes=len(class_order),
+        optimizer=None,
+        clip_values=(0.0, 1.0),
+        device_type='gpu' if str(device).startswith('cuda') and torch.cuda.is_available() else 'cpu',
+    )
+
+    results = {
+        name: {
+            'attack_strengths': attack_strengths,
+            'rgr_scores': [],
+            'rgr_rescaled': [],
+            'per_class_rgr': [],
+            'class_order': class_order,
+        }
+        for name in models_dict
+    }
+
+    if verbose:
+        print('Wasserstein image-level RGR')
+        print(f'Testing {len(attack_strengths)} Wasserstein strengths')
+
+    for eps in attack_strengths:
+        if verbose:
+            print(f'\nGenerating Wasserstein adversarial images: eps={eps:.4f}')
+
+        attack = Wasserstein(
+            estimator=classifier,
+            eps=float(eps),
+            eps_step=float(eps_step),
+            max_iter=int(max_iter),
+            targeted=False,
+            verbose=False,
+        )
+
+        x_adv_01 = attack.generate(
+            x=images_01.numpy().astype(np.float32),
+            y=y_true,
+        )
+
+        x_adv_norm = torch.tensor(x_adv_01, dtype=torch.float32) * 2.0 - 1.0
+
+        x_adv_features = preprocess_fn(x_adv_norm)
+
+        for model_name, model_config in models_dict.items():
+            model, prob_original, model_class_order, model_type, model_device = model_config
+
+            prob_original_aligned = align_proba_to_class_order(
+                prob_original,
+                model_class_order,
+                class_order,
+            )
+
+            if model_type == 'sklearn':
+                prob_perturbed_raw = model.predict_proba(x_adv_features)
+
+            elif model_type == 'pytorch':
+                model.eval()
+                use_device = model_device if model_device is not None else device
+                x_adv_tensor = torch.tensor(x_adv_features, dtype=torch.float32, device=use_device)
+
+                with torch.no_grad():
+                    logits = model(x_adv_tensor)
+                    prob_perturbed_raw = torch.softmax(logits, dim=1).cpu().numpy()
+
+            else:
+                raise ValueError(f"model_type must be 'sklearn' or 'pytorch', got '{model_type}'")
+
+            prob_perturbed = align_proba_to_class_order(
+                prob_perturbed_raw,
+                model_class_order,
+                class_order,
+            )
+
+            rgr_val, rgr_per_class, _ = rgr_cramer_multiclass(
+                prob_original_aligned,
+                prob_perturbed,
+                class_order=class_order,
+                class_weights=class_weights,
+                verbose=False,
+            )
+
+            rgr_score = 0.0 if np.isnan(rgr_val) else float(rgr_val)
+            results[model_name]['rgr_scores'].append(rgr_score)
+            results[model_name]['per_class_rgr'].append(rgr_per_class)
+
+            if verbose:
+                print(f'{model_name}: RGR={rgr_score:.4f}')
+
+    plt.figure(figsize=fig_size)
+
+    for model_name, result in results.items():
+        rgr_scores = np.asarray(result['rgr_scores'], dtype=float)
+
+        rga_full = rga_dict.get(model_name) if rga_dict else None
+        if rga_full is not None:
+            rgr_rescaled = rgr_scores * rga_full
+        else:
+            rgr_rescaled = rgr_scores
+
+        eps_norm = attack_strengths / np.max(attack_strengths) if np.max(attack_strengths) > 0 else attack_strengths
+        aurgr = auc(eps_norm, rgr_rescaled)
+
+        result['rgr_scores'] = rgr_scores.tolist()
+        result['rgr_rescaled'] = rgr_rescaled.tolist()
+        result['per_class_rgr'] = np.asarray(result['per_class_rgr']).tolist()
+        result['aurgr'] = float(aurgr)
+        result['class_order'] = class_order.tolist()
+
+        plt.plot(
+            attack_strengths,
+            rgr_rescaled,
+            '-o',
+            linewidth=2.5,
+            markersize=5,
+            label=f'{model_name} (AURGR={aurgr:.3f})',
+        )
+
+    plt.xlabel('Wasserstein attack strength ε', fontsize=11, fontweight='bold')
+    plt.ylabel('RGR Score', fontsize=11, fontweight='bold')
+    plt.title('Image-level Wasserstein RGR Curves', fontsize=12, fontweight='bold')
+    plt.grid(alpha=0.3, linestyle='--')
+    plt.legend(fontsize=9)
+    plt.tight_layout()
+
+    if save_path is None:
+        plt.show()
+    else:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+
+    plt.close()
+
+    if verbose:
+        print('\nWasserstein Robustness Summary')
+        for model_name, result in results.items():
+            print(f"{model_name}: AURGR_WASSERSTEIN = {result['aurgr']:.4f}")
+
+    return results
+
+
+def compare_models_rgr_spatial_images(
+    models_dict,
+    images,
+    y_true,
+    attack_model,
+    preprocess_fn,
+    attack_strengths,
+    class_order,
+    rga_dict=None,
+    class_weights=None,
+    device=None,
+    fig_size=(12, 6),
+    verbose=True,
+    save_path=None,
+    num_translations=3,
+    num_rotations=3,
+):
+    """
+    Image-level spatial-transformation RGR.
+    """
+
+    attack_strengths = np.asarray(attack_strengths, dtype=float)
+    y_true = np.asarray(y_true).astype(int)
+    class_order = np.asarray(class_order)
+
+    if device is None:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    attack_model = attack_model.to(device)
+    attack_model.eval()
+
+    if isinstance(images, torch.Tensor):
+        images_tensor = images.detach().cpu()
+    else:
+        images_tensor = torch.tensor(images, dtype=torch.float32)
+
+    images_01 = torch.clamp((images_tensor + 1.0) / 2.0, 0.0, 1.0)
+
+    class AttackWrapper(nn.Module):
+        def __init__(self, model):
+            super().__init__()
+            self.model = model
+
+        def forward(self, x):
+            x_norm = x * 2.0 - 1.0
+            return self.model(x_norm)
+
+    wrapped_model = AttackWrapper(attack_model).to(device)
+    loss = nn.CrossEntropyLoss()
+
+    classifier = PyTorchClassifier(
+        model=wrapped_model,
+        loss=loss,
+        input_shape=tuple(images_01.shape[1:]),
+        nb_classes=len(class_order),
+        optimizer=None,
+        clip_values=(0.0, 1.0),
+        device_type='gpu' if str(device).startswith('cuda') and torch.cuda.is_available() else 'cpu',
+    )
+
+    results: dict[str, dict] = {
+        name: {
+            'attack_strengths': attack_strengths.tolist(),
+            'rgr_scores': [],
+            'rgr_rescaled': [],
+            'per_class_rgr': [],
+            'class_order': class_order.tolist(),
+            'aurgr': None,
+        }
+        for name in models_dict
+    }
+
+    if verbose:
+        print('Spatial image-level RGR')
+        print(f'Testing {len(attack_strengths)} spatial strengths')
+
+    for strength in attack_strengths:
+        if verbose:
+            print(f'\nGenerating spatial adversarial images: strength={strength:.4f}')
+
+        attack = SpatialTransformation(
+            classifier=classifier,
+            max_translation=float(strength),
+            max_rotation=float(strength),
+            num_translations=int(num_translations),
+            num_rotations=int(num_rotations),
+            verbose=False,
+        )
+
+        x_adv_01 = attack.generate(
+            x=images_01.numpy().astype(np.float32),
+            y=y_true,
+        )
+
+        x_adv_norm = torch.tensor(x_adv_01, dtype=torch.float32) * 2.0 - 1.0
+        x_adv_features = preprocess_fn(x_adv_norm)
+
+        for model_name, model_config in models_dict.items():
+            model, prob_original, model_class_order, model_type, model_device = model_config
+
+            prob_original_aligned = align_proba_to_class_order(
+                prob_original,
+                model_class_order,
+                class_order,
+            )
+
+            if model_type == 'sklearn':
+                prob_perturbed_raw = model.predict_proba(x_adv_features)
+
+            elif model_type == 'pytorch':
+                model.eval()
+                use_device = model_device if model_device is not None else device
+                x_adv_tensor = torch.tensor(
+                    x_adv_features,
+                    dtype=torch.float32,
+                    device=use_device,
+                )
+
+                with torch.no_grad():
+                    logits = model(x_adv_tensor)
+                    prob_perturbed_raw = torch.softmax(logits, dim=1).cpu().numpy()
+
+            else:
+                raise ValueError(f"model_type must be 'sklearn' or 'pytorch', got '{model_type}'")
+
+            prob_perturbed = align_proba_to_class_order(
+                prob_perturbed_raw,
+                model_class_order,
+                class_order,
+            )
+
+            rgr_val, rgr_per_class, _ = rgr_cramer_multiclass(
+                prob_original_aligned,
+                prob_perturbed,
+                class_order=class_order,
+                class_weights=class_weights,
+                verbose=False,
+            )
+
+            rgr_score = 0.0 if np.isnan(rgr_val) else float(rgr_val)
+            results[model_name]['rgr_scores'].append(rgr_score)
+            results[model_name]['per_class_rgr'].append(rgr_per_class.tolist())
+
+            if verbose:
+                print(f'{model_name}: RGR={rgr_score:.4f}')
+
+    plt.figure(figsize=fig_size)
+
+    for model_name, result in results.items():
+        rgr_scores = np.asarray(result['rgr_scores'], dtype=float)
+
+        rga_full = rga_dict.get(model_name) if rga_dict else None
+        if rga_full is not None:
+            rgr_rescaled = rgr_scores * rga_full
+        else:
+            rgr_rescaled = rgr_scores
+
+        strength_norm = (
+            attack_strengths / np.max(attack_strengths)
+            if np.max(attack_strengths) > 0
+            else attack_strengths
+        )
+        aurgr = auc(strength_norm, rgr_rescaled)
+
+        result['rgr_scores'] = rgr_scores.tolist()
+        result['rgr_rescaled'] = rgr_rescaled.tolist()
+        result['aurgr'] = float(aurgr)
+
+        plt.plot(
+            attack_strengths,
+            rgr_rescaled,
+            '-o',
+            linewidth=2.5,
+            markersize=5,
+            label=f'{model_name} (AURGR={aurgr:.3f})',
+        )
+
+    plt.xlabel('Spatial attack strength', fontsize=11, fontweight='bold')
+    plt.ylabel('RGR Score', fontsize=11, fontweight='bold')
+    plt.title('Image-level Spatial Transformation RGR Curves', fontsize=12, fontweight='bold')
+    plt.grid(alpha=0.3, linestyle='--')
+    plt.legend(fontsize=9)
+    plt.tight_layout()
+
+    if save_path is None:
+        plt.show()
+    else:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+
+    plt.close()
+
+    if verbose:
+        print('\nSpatial Transformation Robustness Summary')
+        for model_name, result in results.items():
+            print(f"{model_name}: AURGR_SPATIAL = {result['aurgr']:.4f}")
 
     return results

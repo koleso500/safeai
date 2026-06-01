@@ -1,8 +1,10 @@
 import numpy as np
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
-from safe.cramer import gini_via_lorenz, cvm1_concordance_weighted
-from safe.utils import ensure_prob_matrix, fill_nan_tail, aurga_from_curve, ideal_prob_matrix
+from safeai.cramer import gini_via_lorenz, cvm1_concordance_weighted
+from safeai.utils import ensure_prob_matrix, fill_nan_tail, aurga_from_curve, ideal_prob_matrix
 
 
 def rga_cramer(y, yhat):

@@ -1,11 +1,13 @@
 import torch
 import numpy as np
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader
 from sklearn.metrics import auc
 
-from safe.cramer import gini_via_lorenz, cvm1_concordance_weighted
-from safe.utils import apply_patch_occlusion, ensure_prob_matrix, get_predictions_from_features, apply_importance_masking
+from safeai.cramer import gini_via_lorenz, cvm1_concordance_weighted
+from safeai.utils import apply_patch_occlusion, ensure_prob_matrix, get_predictions_from_features, apply_importance_masking
 
 
 def rge_cramer(pred, pred_reduced):

@@ -106,10 +106,10 @@ class GradCAM:
     """
     Grad-CAM for a CAMModel.
 
-    By default attempts to hook into `feature_extractor.layer4[-1].conv2` for ResNet18/34.
+    By default, attempts to hook into `feature_extractor.layer4[-1].conv2` for ResNet18/34.
     Provide `target_layer` if different.
-
     """
+
     def __init__(self, cam_model, target_layer=None):
         self.model = cam_model
 
@@ -848,42 +848,42 @@ def show_heatmap_per_class(x_images, importance_maps, labels, class_names, n_cla
 def show_occlusions_same_idx(x_images, patch_rankings, patch_meta, idx=0, fractions=(0.0, 0.2, 0.4, 0.6, 0.8, 1),
                              baseline='blur', blur_ksize=31, blur_sigma=7.0, n_cols=3, save_path=None):
     """
-    Visualize progressive occlusion of image regions based on Grad-CAM importance.
+        Visualize progressive occlusion of image regions based on Grad-CAM importance.
 
-    Shows how an image looks when increasingly important regions (ranked by
-    Grad-CAM) are occluded using a specified baseline strategy. Helps
-    validate that the importance maps correctly identify critical regions.
+        Shows how an image looks when increasingly important regions (ranked by
+        Grad-CAM) are occluded using a specified baseline strategy. Helps
+        validate that the importance maps correctly identify critical regions.
 
-    Parameters
-    ----------
-    x_images : torch.Tensor
-        Image tensors of shape (N, C, H, W)
-    patch_rankings : list of numpy.ndarray
-        List of N arrays, each containing patch indices sorted by importance (most important first)
-    patch_meta : dict
-        Dictionary containing patch metadata with keys:
-        - 'patch_size': tuple of (height, width) for patches
-        - Other metadata needed by apply_importance_masking
-    idx : int, optional
-        Index of image to visualize
-    fractions : tuple of float, optional
-        Fractions of image to occlude, values in [0, 1]
-    baseline : str, optional
-        Occlusion strategy
-    blur_ksize : int, optional
-        Kernel size for blur baseline, must be odd
-    blur_sigma : float, optional
-        Sigma parameter for Gaussian blur
-    n_cols : int, optional
-        Number of columns in subplot grid
-    save_path : str, optional
-        Path to save figure. If None, displays interactively
+        Parameters
+        ----------
+        x_images : torch.Tensor
+            Image tensors of shape (N, C, H, W)
+        patch_rankings : list of numpy.ndarray
+            List of N arrays, each containing patch indices sorted by importance (most important first)
+        patch_meta : dict
+            Dictionary containing patch metadata with keys:
+            - 'patch_size': tuple of (height, width) for patches
+            - Other metadata needed by apply_importance_masking
+        idx : int, optional
+            Index of image to visualize
+        fractions : tuple of float, optional
+            Fractions of image to occlude, values in [0, 1]
+        baseline : str, optional
+            Occlusion strategy
+        blur_ksize : int, optional
+            Kernel size for blur baseline, must be odd
+        blur_sigma : float, optional
+            Sigma parameter for Gaussian blur
+        n_cols : int, optional
+            Number of columns in subplot grid
+        save_path : str, optional
+            Path to save figure. If None, displays interactively
 
-    Returns
-    -------
-    None
-        Displays or saves the figure
-    """
+        Returns
+        -------
+        None
+            Displays or saves the figure
+        """
 
     img0 = x_images[idx:idx+1]
 
