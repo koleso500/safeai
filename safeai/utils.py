@@ -62,6 +62,43 @@ def align_proba_to_class_order(prob, model_class_order, target_class_order):
     return prob[:, idx]
 
 
+def get_model_probabilities(model, x, class_order=None):
+    """
+    Get predicted probabilities from sklearn estimator or Pipeline.
+
+    Parameters
+    ----------
+    model :
+        Fitted sklearn estimator or sklearn Pipeline with predict_proba
+    x :
+        Input data. For Pipelines this should be the original dataframe
+    class_order :
+        Optional desired class order. If provided, probabilities are aligned
+        to this order using model.classes_
+
+    Returns
+    -------
+    np.ndarray
+        Probability matrix
+    """
+    if not hasattr(model, 'predict_proba'):
+        raise ValueError('Model must support predict_proba().')
+
+    prob = model.predict_proba(x)
+
+    if class_order is not None:
+        if not hasattr(model, 'classes_'):
+            raise ValueError('class_order was provided, but model has no classes_ attribute.')
+
+        prob = align_proba_to_class_order(
+            prob,
+            model_class_order=model.classes_,
+            target_class_order=class_order
+        )
+
+    return prob
+
+
 class ScaledLinearHead(nn.Module):
     """
     Linear head that optionally applies the same scaler as sklearn models.

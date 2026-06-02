@@ -4,26 +4,47 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
 from safeai.cramer import gini_via_lorenz, cvm1_concordance_weighted
-from safeai.utils import ensure_prob_matrix, fill_nan_tail, aurga_from_curve, ideal_prob_matrix
+from safeai.utils import ensure_prob_matrix, fill_nan_tail, aurga_from_curve, ideal_prob_matrix, get_model_probabilities
 
 
-def rga_cramer(y, yhat):
+def rga_cramer(y, yhat, x=None, positive_class=1):
     """
     RGA using Cramér–von Mises (CvM) distance
     RGA = 1 - CvM(y, yhat) / G(y)
 
-    Parameters
-    ----------
-    y : array-like
-        True values
-    yhat : array-like
-        Predicted values
+    yhat can be either:
+    1. Predicted scores/probabilities, e.g. model.predict_proba(x)[:, 1]
+    2. Fitted sklearn estimator or Pipeline, if x is provided
 
-    Returns
-    -------
-    float
-        RGA score
+    Examples
+    --------
+    rga_cramer(y_test, y_prob)
+
+    rga_cramer(y_test, pipeline, x=x_test, positive_class=1)
+
     """
+    if hasattr(yhat, 'predict_proba'):
+        if x is None:
+            raise ValueError('x must be provided when yhat is a model or Pipeline')
+
+        prob = get_model_probabilities(yhat, x)
+
+        if prob.ndim != 2 or prob.shape[1] != 2:
+            raise ValueError('For multiclass models use rga_cramer_multiclass')
+
+        if hasattr(yhat, 'classes_'):
+            classes = list(yhat.classes_)
+            if positive_class not in classes:
+                raise ValueError(f'positive_class={positive_class} not found in classes_: {classes}')
+            pos_idx = classes.index(positive_class)
+        else:
+            pos_idx = 1
+
+        yhat = prob[:, pos_idx]
+
+    y = np.asarray(y, dtype=float).reshape(-1)
+    yhat = np.asarray(yhat, dtype=float).reshape(-1)
+
     g = gini_via_lorenz(y)
     if not np.isfinite(g) or g == 0:
         return np.nan
@@ -35,18 +56,26 @@ def rga_cramer(y, yhat):
     return 1 - cvm / g
 
 
-def partial_rga_cramer(y, yhat, n_segments):
+def partial_rga_cramer(y, yhat, n_segments, x=None, positive_class=1):
     """
     Decompose RGA into partial contributions across segments.
+
+    yhat can be either:
+    1. Predicted scores/probabilities, e.g. model.predict_proba(x)[:, 1]
+    2. Fitted sklearn estimator or Pipeline, if x is provided
 
     Parameters
     ----------
     y : array-like
-        True values
-    yhat : array-like
-        Predicted values
+        True values.
+    yhat : array-like or fitted sklearn estimator/Pipeline
+        Predicted values, or a model/Pipeline with predict_proba.
     n_segments : int
-        Number of segments to decompose into
+        Number of segments to decompose into.
+    x : array-like or DataFrame, optional
+        Input features. Required when yhat is a model or Pipeline.
+    positive_class : int or str, default=1
+        Positive class label for binary classification.
 
     Returns
     -------
@@ -56,7 +85,29 @@ def partial_rga_cramer(y, yhat, n_segments):
         - 'partial_rga': Partial RGA contributions for each segment
         - 'cumulative_vector': Cumulative vector [RGA, RGA-RGA_1, ..., 0]
         - 'segment_indices': List of index ranges for each segment
+
     """
+    if hasattr(yhat, 'predict_proba'):
+        if x is None:
+            raise ValueError('x must be provided when yhat is a model or Pipeline')
+
+        prob = get_model_probabilities(yhat, x)
+
+        if prob.ndim != 2 or prob.shape[1] != 2:
+            raise ValueError('For multiclass models use partial_rga_cramer_multiclass')
+
+        if hasattr(yhat, 'classes_'):
+            classes = list(yhat.classes_)
+            if positive_class not in classes:
+                raise ValueError(
+                    f'positive_class={positive_class} not found in classes_: {classes}'
+                )
+            pos_idx = classes.index(positive_class)
+        else:
+            pos_idx = 1
+
+        yhat = prob[:, pos_idx]
+
     y = np.asarray(y, dtype=float).reshape(-1)
     yhat = np.asarray(yhat, dtype=float).reshape(-1)
     mask = ~np.isnan(y) & ~np.isnan(yhat)
@@ -114,8 +165,7 @@ def partial_rga_cramer(y, yhat, n_segments):
         # Weight by segment's contribution to total Gini
         segment_gini = gini_via_lorenz(y_segment)
 
-        if np.isfinite(segment_gini) and segment_gini > 0:
-            # Normalize by segment size relative to total
+        if np.isfinite(segment_rga) and np.isfinite(segment_gini) and segment_gini > 0:
             weight = len(y_segment) / n
             weighted_contribution = segment_rga * segment_gini * weight / full_gini
         else:
@@ -146,6 +196,89 @@ def partial_rga_cramer(y, yhat, n_segments):
         'cumulative_vector': cumulative_vector,
         'segment_indices': segment_indices
     }
+
+
+def compare_models_rga_binary(models_dict, y, x_test=None, positive_class=1,
+                              n_segments=10, fig_size=(12, 5),
+                              verbose=True, save_path=None):
+    """
+    Compare binary classifiers using RGA
+
+    Parameters
+    ----------
+    models_dict : dict
+        Either:
+        - {'Model name': y_score_array}
+        - {'Model name': fitted sklearn estimator or Pipeline}
+
+        If fitted models/Pipelines are passed, x_test must be provided.
+
+    y : array-like
+        True binary labels.
+    x_test : array-like or DataFrame, optional
+        Test features, required when models_dict contains fitted models/Pipelines
+    positive_class : int or str, default=1
+        Positive class used for probability extraction
+    n_segments : int
+        Number of segments for partial RGA
+    fig_size : tuple, default=(14, 6)
+        Figure size for the comparison plot
+    verbose : bool, default=True
+        If True, print the RGA score for each model
+    save_path : str or None, default=None
+        If provided, saves the comparison plot to this path
+        If None, displays the plot interactively
+    """
+    results = {}
+
+    plt.figure(figsize=fig_size)
+    cmap = plt.get_cmap('tab10')
+    colors = cmap(np.linspace(0, 1, len(models_dict)))
+
+    for (model_name, yhat_or_model), color in zip(models_dict.items(), colors):
+        if verbose:
+            print(f"\nEvaluating {model_name}...")
+
+        res = partial_rga_cramer(
+            y,
+            yhat_or_model,
+            n_segments=n_segments,
+            x=x_test,
+            positive_class=positive_class
+        )
+
+        results[model_name] = res
+
+        x_axis = np.linspace(0, 1, n_segments + 1)
+        plt.plot(
+            x_axis,
+            res['cumulative_vector'],
+            '-o',
+            linewidth=2.3,
+            markersize=4.5,
+            color=color,
+            label=f"{model_name} (RGA={res['full_rga']:.3f})"
+        )
+
+        if verbose:
+            print(f"{model_name}: RGA={res['full_rga']:.4f}")
+
+    plt.xlabel('Fraction of Data Removed', fontsize=11, fontweight='bold')
+    plt.ylabel('RGA Score', fontsize=11, fontweight='bold')
+    plt.title('Binary RGA Curves Comparison', fontsize=12, fontweight='bold')
+    plt.grid(alpha=0.3, linestyle='--')
+    plt.xlim([0, 1])
+    plt.legend(fontsize=9)
+    plt.tight_layout()
+
+    if save_path is None:
+        plt.show()
+    else:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+
+    plt.close()
+
+    return results
 
 
 def rga_cramer_multiclass(y_labels, prob_matrix, class_order=None, verbose=False):
