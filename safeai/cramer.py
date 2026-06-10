@@ -1,3 +1,14 @@
+"""
+Lorenz/concordance Cramer-von Mises utilities.
+
+The functions in this module implement the Lorenz-curve and concordance-curve
+building blocks used by SAFE-AI metrics. They are based on the identity between
+weighted concordance-curve divergence and the rank-based Cramer-von Mises
+formulation discussed in:
+
+https://www.worldscientific.com/doi/abs/10.1142/S0218202526420030
+"""
+
 import numpy as np
 
 def lorenz_curve(y):

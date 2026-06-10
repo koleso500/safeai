@@ -4,7 +4,7 @@ build-backend = 'setuptools.build_meta'
 
 [project]
 name = 'safe-ai-metrics'
-version = '0.1.1'
+version = '0.2.0'
 description = 'SAFE-AI metrics for accuracy, robustness, and explainability evaluation'
 readme = 'README.md'
 requires-python = '>=3.10'

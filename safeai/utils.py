@@ -1,34 +1,106 @@
-import numpy as np
+"""
+Shared utilities for SAFE-AI metrics.
+
+This module contains helpers used across RGA, RGR, and RGE,
+plus optional image, Grad-CAM, dataset, and visualization utilities used by
+image-based workflows.
+"""
+
 import random
+from typing import Any
+
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as nnf
-import cv2
-import matplotlib.pyplot as plt
-
-from PIL import Image
 from sklearn.metrics import auc
 from torch.utils.data import Dataset
-from torchvision import datasets
 
+
+__all__ = [
+    # Probability helpers
+    'ensure_prob_matrix',
+    'align_proba_to_class_order',
+    'get_model_probabilities',
+    'get_predictions_from_features',
+
+    # Shared metric helpers
+    'clean_pair',
+    'validate_method',
+    'validate_class_weights',
+    'rescale_by_rga',
+    'area_under_normalized_curve',
+    'nan_to_zero',
+    'resolve_class_orders',
+
+    # Feature masking helpers
+    'apply_feature_baseline',
+    'mask_columns',
+    'normalize_rankings',
+
+    # RGA helpers
+    'fill_nan_tail',
+    'aurga_from_curve',
+    'ideal_prob_matrix',
+
+    # Image / Grad-CAM helpers
+    'ScaledLinearHead',
+    'CAMModel',
+    'GradCAM',
+    'train_cam_model',
+    'blur_images_gaussian',
+    'compute_gradcam_maps',
+    'precompute_patch_rankings',
+    'apply_importance_masking',
+    'apply_patch_occlusion',
+    'extract_features_from_images',
+
+    # Dataset / visualization helpers
+    'crop_img',
+    'CroppedImage',
+    'denorm_img',
+    'show_heatmap_per_class',
+    'show_occlusions_same_idx'
+]
+
+
+# ---- Probability helpers ----
 def ensure_prob_matrix(prob, class_order):
+    """
+    Ensure that probabilities are represented as a 2D probability matrix.
+
+    Parameters
+    ----------
+    prob : array-like
+        Either a 1D binary positive-class probability vector or a 2D
+        probability matrix.
+
+    class_order : array-like
+        Class order corresponding to the probability columns.
+
+    Returns
+    -------
+    np.ndarray
+        Probability matrix with shape (n_samples, n_classes).
+    """
     prob = np.asarray(prob, dtype=float)
     class_order = np.asarray(class_order)
 
     if prob.ndim == 1:
         if len(class_order) != 2:
-            raise ValueError("1D prob is only supported for binary (2 classes).")
+            raise ValueError('1D prob is only supported for binary (2 classes).')
         p_pos = prob
         return np.column_stack([1.0 - p_pos, p_pos])
 
     if prob.ndim == 2:
         if prob.shape[1] != len(class_order):
             raise ValueError(
-                f"prob has {prob.shape[1]} columns but class_order has {len(class_order)}."
+                f'prob has {prob.shape[1]} columns but class_order has {len(class_order)}.'
             )
         return prob
 
-    raise ValueError("prob must be shape (n,) or (n,c).")
+    raise ValueError('prob must be shape (n,) or (n,c).')
+
 
 def align_proba_to_class_order(prob, model_class_order, target_class_order):
     """
@@ -37,49 +109,47 @@ def align_proba_to_class_order(prob, model_class_order, target_class_order):
     Parameters
     ----------
     prob : array-like, shape (n_samples, n_classes)
-        Probability matrix with columns in model_class_order
+        Probability matrix with columns in model_class_order.
+
     model_class_order : array-like
-        Current order of classes (e.g., model.classes_ for sklearn)
+        Current order of probability columns, for example ``model.classes_``.
+
     target_class_order : array-like
-        Desired order of classes
+        Desired output class order.
 
     Returns
     -------
     np.ndarray
-        Probability matrix with columns reordered to match target_class_order
-
-    Examples
-    --------
-    prob_aligned = align_proba_to_class_order(model.predict_proba(x), model.classes_, [0, 1, 2])
+        Probability matrix with columns reordered to target_class_order.
     """
     prob = np.asarray(prob)
     model_class_order = list(model_class_order)
     target_class_order = list(target_class_order)
 
-    # Find the index mapping
     idx = [model_class_order.index(c) for c in target_class_order]
-
     return prob[:, idx]
 
 
-def get_model_probabilities(model, x, class_order=None):
+def get_model_probabilities(model: Any, x, class_order=None):
     """
-    Get predicted probabilities from sklearn estimator or Pipeline.
+    Get predicted probabilities from a sklearn estimator or Pipeline.
 
     Parameters
     ----------
-    model :
-        Fitted sklearn estimator or sklearn Pipeline with predict_proba
-    x :
-        Input data. For Pipelines this should be the original dataframe
-    class_order :
-        Optional desired class order. If provided, probabilities are aligned
-        to this order using model.classes_
+    model : object
+        Fitted sklearn estimator or Pipeline with predict_proba.
+
+    x : array-like or DataFrame
+        Input data.
+
+    class_order : array-like, optional
+        Desired class order. If provided, probabilities are aligned using
+        ``model.classes_``.
 
     Returns
     -------
     np.ndarray
-        Probability matrix
+        Probability matrix.
     """
     if not hasattr(model, 'predict_proba'):
         raise ValueError('Model must support predict_proba().')
@@ -99,10 +169,209 @@ def get_model_probabilities(model, x, class_order=None):
     return prob
 
 
+def get_predictions_from_features(
+    features,
+    model: Any,
+    model_class_order,
+    class_order,
+    model_type='sklearn',
+    device=None,
+    batch_size=64
+):
+    """
+    Get class probabilities from a model given feature vectors.
+
+    Parameters
+    ----------
+    features : array-like
+        Feature matrix with shape (n_samples, n_features).
+
+    model : object
+        sklearn model with predict_proba or PyTorch module producing logits.
+
+    model_class_order : array-like
+        Class order produced by the model.
+
+    class_order : array-like
+        Desired canonical class order.
+
+    model_type : {'sklearn', 'pytorch'}, default='sklearn'
+        Type of model.
+
+    device : torch.device or str, optional
+        Device used for PyTorch inference.
+
+    batch_size : int, default=64
+        Batch size for PyTorch inference.
+
+    Returns
+    -------
+    np.ndarray
+        Probabilities aligned to class_order.
+    """
+    if model_type == 'sklearn':
+        probs = model.predict_proba(features)
+
+    elif model_type == 'pytorch':
+        if device is None:
+            device = next(model.parameters()).device
+
+        model.eval()
+        probs_list = []
+        with torch.no_grad():
+            for i in range(0, len(features), batch_size):
+                batch = torch.tensor(features[i:i + batch_size], dtype=torch.float32, device=device)
+                logits = model(batch)
+                probs_list.append(torch.softmax(logits, dim=1).cpu().numpy())
+        probs = np.vstack(probs_list)
+
+    else:
+        raise ValueError(f"model_type must be 'sklearn' or 'pytorch', got {model_type}")
+
+    return align_proba_to_class_order(probs, model_class_order, class_order)
+
+
+# ---- Shared metric helpers ----
+def clean_pair(a, b):
+    """
+    Clean two paired 1D arrays by removing non-finite paired values.
+    """
+    a = np.asarray(a, dtype=float).reshape(-1)
+    b = np.asarray(b, dtype=float).reshape(-1)
+
+    if len(a) != len(b):
+        raise ValueError(f'Inputs must have the same length. Got {len(a)} and {len(b)}.')
+
+    mask = np.isfinite(a) & np.isfinite(b)
+    return a[mask], b[mask]
+
+
+def validate_method(method, *, allowed):
+    """
+    Validate that a method name is one of the allowed options.
+    """
+    if method not in allowed:
+        raise ValueError(f'method must be one of {allowed}. Got {method}.')
+
+
+def validate_class_weights(class_weights, n_classes):
+    """
+    Validate or create class weights for multiclass aggregation.
+    """
+    if class_weights is None:
+        return np.ones(n_classes, dtype=float) / n_classes
+
+    class_weights = np.asarray(class_weights, dtype=float)
+    if len(class_weights) != n_classes:
+        raise ValueError(
+            f'class_weights length {len(class_weights)} does not match n_classes {n_classes}.'
+        )
+    return class_weights
+
+
+def rescale_by_rga(scores, rga_full):
+    """
+    Rescale a metric curve by a full RGA score if provided.
+    """
+    scores = np.asarray(scores, dtype=float)
+    if rga_full is not None and np.isfinite(rga_full):
+        return scores * float(rga_full)
+    return scores
+
+
+def area_under_normalized_curve(x_values, y_values):
+    """
+    Compute area under a curve after normalizing x-values to [0, 1].
+    """
+    x_values = np.asarray(x_values, dtype=float)
+    y_values = np.asarray(y_values, dtype=float)
+
+    if len(x_values) == 0:
+        return np.nan
+
+    max_x = float(np.max(x_values))
+    x_norm = x_values / max_x if max_x > 0 else x_values
+    return float(auc(x_norm, y_values))
+
+
+def nan_to_zero(value):
+    """
+    Replace a non-finite scalar value with 0.0.
+    """
+    return 0.0 if not np.isfinite(value) else float(value)
+
+
+def resolve_class_orders(model, *, model_class_order=None, class_order=None, prob=None):
+    """
+    Resolve the model output class order and target class order.
+    """
+    if model_class_order is None:
+        if hasattr(model, 'classes_'):
+            model_class_order = np.asarray(model.classes_)
+        elif class_order is not None:
+            model_class_order = np.asarray(class_order)
+        elif prob is not None and np.asarray(prob).ndim == 2:
+            model_class_order = np.arange(np.asarray(prob).shape[1])
+        else:
+            raise ValueError('model_class_order or class_order must be provided.')
+
+    model_class_order = np.asarray(model_class_order)
+
+    if class_order is None:
+        class_order = model_class_order
+    else:
+        class_order = np.asarray(class_order)
+
+    return model_class_order, class_order
+
+
+# ---- Feature masking helpers ----
+def apply_feature_baseline(x_masked, cols, *, baseline, feat_mean=None):
+    """
+    Apply a feature masking baseline in-place.
+    """
+    if baseline == 'zero':
+        x_masked[:, cols] = 0.0
+    elif baseline == 'mean':
+        if feat_mean is None:
+            raise ValueError("feat_mean is required when baseline='mean'.")
+        x_masked[:, cols] = feat_mean[cols]
+    else:
+        raise ValueError(f"Unknown baseline: {baseline}. Use 'zero' or 'mean'.")
+
+
+def mask_columns(x, cols, *, baseline, feat_mean=None):
+    """
+    Return a copy of x with selected columns masked.
+    """
+    x_masked = np.asarray(x, dtype=float).copy()
+
+    if len(cols) > 0:
+        apply_feature_baseline(
+            x_masked,
+            cols,
+            baseline=baseline,
+            feat_mean=feat_mean
+        )
+
+    return x_masked
+
+
+def normalize_rankings(feature_rankings, models):
+    """
+    Normalize feature ranking input into a model_name -> ranking mapping.
+    """
+    if isinstance(feature_rankings, dict):
+        return feature_rankings
+    if feature_rankings is None:
+        return {}
+    return {name: feature_rankings for name in models}
+
+
+# ---- Image / Grad-CAM helpers ----
 class ScaledLinearHead(nn.Module):
     """
     Linear head that optionally applies the same scaler as sklearn models.
-    Scaling is in the forward pass so Grad-CAM path matches sklearn preprocessing.
     """
 
     def __init__(self, in_dim, n_classes, scaler=None, eps=1e-12):
@@ -113,7 +382,6 @@ class ScaledLinearHead(nn.Module):
         if self.has_scaler:
             mean = torch.tensor(scaler.mean_, dtype=torch.float32)
             scale = torch.tensor(scaler.scale_, dtype=torch.float32)
-            # avoid division by zero
             scale = torch.clamp(scale, min=eps)
             self.register_buffer('mean', mean)
             self.register_buffer('scale', scale)
@@ -126,7 +394,7 @@ class ScaledLinearHead(nn.Module):
 
 class CAMModel(nn.Module):
     """
-    Simple wrapper
+    Simple wrapper combining a feature extractor and classification head.
     """
 
     def __init__(self, feature_extractor, head):
@@ -142,9 +410,6 @@ class CAMModel(nn.Module):
 class GradCAM:
     """
     Grad-CAM for a CAMModel.
-
-    By default, attempts to hook into `feature_extractor.layer4[-1].conv2` for ResNet18/34.
-    Provide `target_layer` if different.
     """
 
     def __init__(self, cam_model, target_layer=None):
@@ -155,7 +420,7 @@ class GradCAM:
             if hasattr(fe, 'layer4'):
                 target_layer = fe.layer4[-1].conv2
             else:
-                raise ValueError('Cannot auto-detect target layer. Provide target_layer')
+                raise ValueError('Cannot auto-detect target layer. Provide target_layer.')
 
         self.target_layer = target_layer
         self.activations = None
@@ -181,49 +446,15 @@ class GradCAM:
 
     @torch.no_grad()
     def predict_classes(self, images, device, batch_size=64):
-        """
-        Predict argmax class for each image.
-
-        Parameters
-        ----------
-        images :
-            Input tensor (N, C, H, W)
-        device :
-            Torch device
-        batch_size :
-            Batch size for forward passes
-
-        Returns
-        -------
-        np.ndarray
-            Predicted class
-        """
         self.model.eval()
         preds = []
         for i in range(0, len(images), batch_size):
-            x = images[i: i + batch_size].to(device, non_blocking=True)
+            x = images[i:i + batch_size].to(device, non_blocking=True)
             logits = self.model(x)
             preds.append(torch.argmax(logits, dim=1).cpu().numpy())
         return np.concatenate(preds, axis=0)
 
     def cam_single(self, image, target_class=None, device=None):
-        """
-        Compute Grad-CAM for a single image.
-
-        Parameters
-        ----------
-        image :
-            Tensor of shape (C, H, W) or (1, C, H, W)
-        target_class :
-            Class to explain. If None, uses model argmax
-        device :
-            Device to run on. If None, inferred from model parameters
-
-        Returns
-        -------
-        np.ndarray
-            Normalized heatmap (H, W) in [0, 1]
-        """
         if device is None:
             device = next(self.model.parameters()).device
 
@@ -247,55 +478,34 @@ class GradCAM:
         if self.activations is None or self.gradients is None:
             raise RuntimeError('GradCAM hooks did not capture activations or gradients.')
 
-        # Weights
         weights = torch.mean(self.gradients, dim=(2, 3), keepdim=True)
         cam = torch.sum(weights * self.activations, dim=1, keepdim=True)
         cam = nnf.relu(cam)
 
-        cam = nnf.interpolate(cam, size=image.shape[2:], mode="bilinear", align_corners=False)
+        cam = nnf.interpolate(cam, size=image.shape[2:], mode='bilinear', align_corners=False)
         cam = cam.squeeze().detach().cpu().numpy()
 
         mn, mx = float(cam.min()), float(cam.max())
         if mx > mn:
-            cam = (cam - mn) / (mx - mn)
-        else:
-            cam = np.zeros_like(cam)
-
-        return cam
+            return (cam - mn) / (mx - mn)
+        return np.zeros_like(cam)
 
 
-def train_cam_model(feature_extractor, images, labels, scaler=None,
-                    n_classes=None, device=None,
-                    epochs=15, lr=1e-3, batch_size=64, verbose=True):
+def train_cam_model(
+    feature_extractor,
+    images,
+    labels,
+    scaler=None,
+    n_classes=None,
+    device=None,
+    epochs=15,
+    lr=1e-3,
+    batch_size=64,
+    verbose=True
+):
     """
-    Train a linear head (with optional scaler) on top of a frozen feature extractor.
-    Uses true labels.
-
-    Parameters
-    ----------
-    feature_extractor :
-        Torch feature extractor (e.g., ResNet with removed classifier)
-    images :
-        Image tensor (N, C, H, W)
-    labels :
-        Class labels, length N
-    scaler :
-        sklearn-like StandardScaler to embed into the head forward pass
-    n_classes :
-        Number of classes. If None, inferred from unique labels
-    device :
-        Torch device. If None, inferred from feature_extractor parameters
-    epochs, lr, batch_size :
-        Training hyperparameters
-    verbose :
-        Print progress
-
-    Returns
-    -------
-    CAMModel
-        Frozen feature extractor and trained head
+    Train a linear CAM head on top of a frozen feature extractor.
     """
-
     if device is None:
         device = next(feature_extractor.parameters()).device
 
@@ -307,7 +517,6 @@ def train_cam_model(feature_extractor, images, labels, scaler=None,
     if n_classes is None:
         n_classes = int(len(np.unique(labels)))
 
-    # Extract features once
     if verbose:
         print('Extracting raw features for CAM training...')
 
@@ -318,8 +527,7 @@ def train_cam_model(feature_extractor, images, labels, scaler=None,
             feats_list.append(feature_extractor(x).cpu().numpy())
     feats = np.vstack(feats_list)
 
-    in_dim = feats.shape[1]
-    head = ScaledLinearHead(in_dim, n_classes, scaler=scaler).to(device)
+    head = ScaledLinearHead(feats.shape[1], n_classes, scaler=scaler).to(device)
     cam_model = CAMModel(feature_extractor, head).to(device)
 
     x = torch.tensor(feats, dtype=torch.float32)
@@ -327,7 +535,8 @@ def train_cam_model(feature_extractor, images, labels, scaler=None,
 
     loader = torch.utils.data.DataLoader(
         torch.utils.data.TensorDataset(x, y),
-        batch_size=batch_size, shuffle=True
+        batch_size=batch_size,
+        shuffle=True
     )
 
     opt = torch.optim.Adam(cam_model.head.parameters(), lr=lr)
@@ -341,7 +550,8 @@ def train_cam_model(feature_extractor, images, labels, scaler=None,
         tot_loss, correct, total = 0.0, 0, 0
 
         for xb, yb in loader:
-            xb, yb = xb.to(device, non_blocking=True), yb.to(device, non_blocking=True)
+            xb = xb.to(device, non_blocking=True)
+            yb = yb.to(device, non_blocking=True)
 
             opt.zero_grad(set_to_none=True)
             logits = cam_model.head(xb)
@@ -355,7 +565,10 @@ def train_cam_model(feature_extractor, images, labels, scaler=None,
             total += int(yb.size(0))
 
         if verbose and ((ep + 1) % 5 == 0 or ep == epochs - 1):
-            print(f'Epoch {ep + 1:02d}/{epochs}: loss={tot_loss / len(loader):.4f}, acc={100 * correct / total:.2f}%')
+            print(
+                f'Epoch {ep + 1:02d}/{epochs}: '
+                f'loss={tot_loss / len(loader):.4f}, acc={100 * correct / total:.2f}%'
+            )
 
     cam_model.eval()
     return cam_model
@@ -363,21 +576,7 @@ def train_cam_model(feature_extractor, images, labels, scaler=None,
 
 def blur_images_gaussian(images, ksize=31, sigma=7.0):
     """
-    Applies Gaussian blur to a batch of images (N, C, H, W) using separable conv.
-
-    Parameters
-    ----------
-    images :
-        Input images tensor (N, C, H, W)
-    ksize :
-        Kernel size. If even, it will be incremented by 1 to keep it odd
-    sigma :
-        Gaussian sigma
-
-    Returns
-    -------
-    torch.Tensor
-        Blurred images, same shape as input
+    Apply Gaussian blur to a batch of images using separable convolution.
     """
     if ksize % 2 == 0:
         ksize += 1
@@ -385,12 +584,10 @@ def blur_images_gaussian(images, ksize=31, sigma=7.0):
     device = images.device
     dtype = images.dtype
 
-    # Gaussian kernel
     x = torch.arange(ksize, device=device, dtype=dtype) - (ksize - 1) / 2.0
     g = torch.exp(-(x ** 2) / (2 * sigma ** 2))
     g = g / g.sum()
 
-    # Separable kernels
     g_x = g.view(1, 1, 1, ksize).repeat(images.shape[1], 1, 1, 1)
     g_y = g.view(1, 1, ksize, 1).repeat(images.shape[1], 1, 1, 1)
 
@@ -403,24 +600,6 @@ def blur_images_gaussian(images, ksize=31, sigma=7.0):
 def compute_gradcam_maps(images, cam_model, device=None, batch_pred=64, verbose=True):
     """
     Compute Grad-CAM importance maps for a batch of images.
-
-    Parameters
-    ----------
-    images :
-        Image tensor (N, C, H, W)
-    cam_model :
-        CAMModel used for Grad-CAM
-    device :
-        Torch device. If None, inferred from cam_model parameters
-    batch_pred :
-        Batch size used for predicting target classes
-    verbose :
-        Print progress
-
-    Returns
-    -------
-    np.ndarray
-        Importance maps, shape (N, H, W), dtype float32.
     """
     if device is None:
         device = next(cam_model.parameters()).device
@@ -433,6 +612,7 @@ def compute_gradcam_maps(images, cam_model, device=None, batch_pred=64, verbose=
 
     if verbose:
         print('Computing Grad-CAM maps...')
+
     maps = []
     for i in range(len(images)):
         maps.append(gradcam.cam_single(images[i:i + 1], target_class=int(targets[i]), device=device))
@@ -446,20 +626,6 @@ def compute_gradcam_maps(images, cam_model, device=None, batch_pred=64, verbose=
 def precompute_patch_rankings(importance_maps, patch_size=32):
     """
     Convert per-pixel importance maps into per-image patch rankings.
-
-    Parameters
-    ----------
-    importance_maps :
-        Array of shape (N, H, W)
-    patch_size:
-        Size of square patches
-
-    Returns
-    -------
-    rankings :
-        List of length N with arrays of patch indices sorted by descending importance
-    meta :
-        PatchMeta describing the grid
     """
     n, h, w = importance_maps.shape
     n_ph = h // patch_size
@@ -477,7 +643,10 @@ def precompute_patch_rankings(importance_maps, patch_size=32):
     rankings = []
     for i in range(n):
         imp = importance_maps[i]
-        scores = np.array([imp[y0:y1, x0:x1].mean() for (y0, y1, x0, x1) in patch_coords], dtype=np.float32)
+        scores = np.array(
+            [imp[y0:y1, x0:x1].mean() for (y0, y1, x0, x1) in patch_coords],
+            dtype=np.float32,
+        )
         rankings.append(np.argsort(scores)[::-1])
 
     meta = {
@@ -490,46 +659,26 @@ def precompute_patch_rankings(importance_maps, patch_size=32):
     return rankings, meta
 
 
-def apply_importance_masking(images, patch_rankings, patch_meta, fraction_to_mask,
-                             mask_strategy='most_important',
-                             mask_value=0.0,
-                             baseline='constant',
-                             blur_ksize=31, blur_sigma=7.0):
+def apply_importance_masking(
+    images,
+    patch_rankings,
+    patch_meta,
+    fraction_to_mask,
+    mask_strategy='most_important',
+    mask_value=0.0,
+    baseline='constant',
+    blur_ksize=31,
+    blur_sigma=7.0
+):
     """
     Mask a fraction of the image area using patch importance rankings.
-
-    Parameters
-    ----------
-    images :
-        Tensor (N, C, H, W)
-    patch_rankings :
-        Per-image arrays of patch indices sorted by descending patch importance
-    patch_meta :
-        Produced by `precompute_patch_rankings`
-    fraction_to_mask :
-        Fraction of total pixels to mask in [0, 1]
-    mask_strategy :
-        'most_important' masks top-ranked patches, supports adding new strategies later
-    mask_value :
-        Constant value used if baseline='constant'
-    baseline :
-        - 'constant': fill masked area with mask_value
-        - 'blur': replace masked area with blurred content
-    blur_ksize, blur_sigma :
-        Parameters for Gaussian blur baseline
-
-    Returns
-    -------
-    torch.Tensor
-        Masked images, same shape as input
     """
     out = images.clone()
-    n, c, h, w = out.shape
+    _, _, h, w = out.shape
 
+    blurred = None
     if baseline == 'blur':
         blurred = blur_images_gaussian(images, ksize=blur_ksize, sigma=blur_sigma)
-    else:
-        blurred = None
 
     patch_size = patch_meta['patch_size']
     patch_pixels = patch_size * patch_size
@@ -543,7 +692,7 @@ def apply_importance_masking(images, patch_rankings, patch_meta, fraction_to_mas
 
     coords = patch_meta['patch_coords']
 
-    for i in range(n):
+    for i in range(out.shape[0]):
         order = patch_rankings[i]
         if mask_strategy == 'most_important':
             chosen = order[:k]
@@ -560,88 +709,53 @@ def apply_importance_masking(images, patch_rankings, patch_meta, fraction_to_mas
     return out
 
 
-def apply_patch_occlusion(images, num_patches, patch_size=32, random_seed=None,
-                          mask_value=0.0,
-                          baseline='constant',
-                          blur_ksize=31, blur_sigma=7.0):
+def apply_patch_occlusion(
+    images,
+    num_patches,
+    patch_size=32,
+    random_seed=None,
+    mask_value=0.0,
+    baseline='constant',
+    blur_ksize=31,
+    blur_sigma=7.0
+):
     """
-    Random patch masking.
-
-    Parameters
-    ----------
-    images :
-        Tensor (N, C, H, W)
-    num_patches :
-        Number of random patches to mask per image
-    patch_size :
-        Square patch size
-    random_seed :
-        If provided, seeds torch and numpy for reproducibility
-    mask_value :
-        Constant fill value used when baseline='constant'
-    baseline :
-        - 'constant': fill masked area with mask_value
-        - 'blur': replace masked area with blurred content
-    blur_ksize, blur_sigma:
-        Parameters for Gaussian blur baseline
-
-    Returns
-    -------
-    torch.Tensor
-        Masked images, same shape as input
+    Random patch masking for a batch of images.
     """
     if random_seed is not None:
         random.seed(random_seed)
         torch.manual_seed(random_seed)
 
     out = images.clone()
-    n, c, h, w = out.shape
+    _, _, h, w = out.shape
     if num_patches <= 0:
         return out
 
+    blurred = None
     if baseline == 'blur':
         blurred = blur_images_gaussian(images, ksize=blur_ksize, sigma=blur_sigma)
-    else:
-        blurred = None
 
-    for i in range(n):
+    if h < patch_size or w < patch_size:
+        raise ValueError('patch_size must not exceed image height or width.')
+
+    for i in range(out.shape[0]):
         for _ in range(num_patches):
             y0 = random.randint(0, h - patch_size)
             x0 = random.randint(0, w - patch_size)
             if baseline == 'blur':
-                out[i, :, y0:y0 + patch_size, x0:x0 + patch_size] = blurred[i, :, y0:y0 + patch_size,
-                                                                    x0:x0 + patch_size]
+                out[i, :, y0:y0 + patch_size, x0:x0 + patch_size] = blurred[
+                    i, :, y0:y0 + patch_size, x0:x0 + patch_size
+                ]
             else:
                 out[i, :, y0:y0 + patch_size, x0:x0 + patch_size] = mask_value
+
     return out
 
 
-def extract_features_from_images(images, feature_extractor, pca=None, scaler=None,
-                                 device=None, batch_size=64):
+def extract_features_from_images(images, feature_extractor, pca=None, scaler=None, device=None, batch_size=64):
     """
-    Extract features from images using a torch feature extractor, optionally apply PCA and scaling.
-
-    Parameters
-    ----------
-    images :
-        Tensor (N, C, H, W)
-    feature_extractor :
-        Torch module mapping images -> features (N, D)
-    pca :
-        sklearn-like object with `.transform(x)` or None
-    scaler :
-        sklearn-like object with `.transform(x)` or None
-    device :
-        Device for feature extraction. If None, inferred from feature_extractor
-    batch_size :
-        Batch size for extraction
-
-    Returns
-    -------
-    np.ndarray
-        Feature matrix after optional PCA and scaling
+    Extract features from images using a torch feature extractor.
     """
-
     feature_extractor.eval()
     if device is None:
         device = next(feature_extractor.parameters()).device
@@ -661,70 +775,13 @@ def extract_features_from_images(images, feature_extractor, pca=None, scaler=Non
     return x
 
 
-def get_predictions_from_features(features, model, model_class_order, class_order,
-                                  model_type='sklearn', device=None, batch_size=64):
-    """
-    Get class probabilities from a model given feature vectors and align them to `class_order`.
-
-    Parameters
-    ----------
-    features :
-        Feature matrix (N, D)
-    model :
-        sklearn model with predict_proba or torch module producing logits
-    model_class_order :
-        Class labels order as produced by the model (e.g., sklearn `model.classes_`)
-    class_order :
-        Desired canonical class order
-    model_type :
-        'sklearn' or 'pytorch'
-    device :
-        Torch device required when model_type='pytorch'
-    batch_size :
-        Batch size for torch inference
-
-    Returns
-    -------
-    np.ndarray
-        Probabilities aligned to `class_order`, shape (N, n_classes)
-    """
-    if model_type == 'sklearn':
-        probs = model.predict_proba(features)
-
-    elif model_type == 'pytorch':
-        model.eval()
-        probs_list = []
-        with torch.no_grad():
-            for i in range(0, len(features), batch_size):
-                batch = torch.tensor(features[i:i + batch_size], dtype=torch.float32).to(device)
-                logits = model(batch)
-                probs_list.append(torch.softmax(logits, dim=1).cpu().numpy())
-        probs = np.vstack(probs_list)
-
-    else:
-        raise ValueError(f"model_type must be 'sklearn' or 'pytorch', got {model_type}")
-
-    return align_proba_to_class_order(probs, model_class_order, class_order)
-
-
+# ---- Dataset / visualization helpers ----
 def crop_img(img):
     """
     Crop image to the bounding box of the largest foreground object.
-    Automatically detects the largest contiguous object in the image and crops
-    to its bounding rectangle with a small padding.
-
-    Parameters
-    ----------
-    img :
-        Can be grayscale (H, W) or colored (H, W, C).
-
-    Returns
-    -------
-        Cropped image containing the largest detected object with 5-pixel padding.
-        Returns original image unchanged if:
-        - No contours are detected
-        - Cropped region would be smaller than 100x100 pixels
     """
+    import cv2
+
     if len(img.shape) == 3:
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     else:
@@ -764,9 +821,11 @@ def crop_img(img):
 class CroppedImage(Dataset):
     """
     PyTorch Dataset for loading images with optional automatic cropping.
-    Uses OpenCV for image loading and preprocessing before applying transforms.
     """
+
     def __init__(self, root_dir, transform=None, apply_crop=True):
+        from torchvision import datasets
+
         self.dataset = datasets.ImageFolder(root_dir)
         self.transform = transform
         self.apply_crop = apply_crop
@@ -777,14 +836,20 @@ class CroppedImage(Dataset):
         return len(self.dataset)
 
     def __getitem__(self, idx):
+        import cv2
+        from PIL import Image
+
         img_path, label = self.dataset.samples[idx]
         img = cv2.imread(img_path)
+
+        if img is None:
+            raise ValueError(f'Could not read image: {img_path}')
 
         if self.apply_crop:
             try:
                 img = crop_img(img)
-            except Exception as e:
-                print(f'Cropping failed for {img_path}: {e}')
+            except Exception as exc:
+                print(f'Cropping failed for {img_path}: {exc}')
 
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         img = Image.fromarray(img)
@@ -797,77 +862,43 @@ class CroppedImage(Dataset):
 
 def denorm_img(img_t, mean=0.5, std=0.5):
     """
-        Denormalize a normalized image tensor for visualization.
-        Converts a normalized PyTorch tensor (C, H, W) to a numpy array (H, W, C).
-
-        Parameters
-        ----------
-        img_t : torch.Tensor
-            Normalized image tensor of shape (C, H, W)
-        mean : float, optional
-            Mean value used during normalization
-        std : float, optional
-            Standard deviation used during normalization
-
-        Returns
-        -------
-        numpy.ndarray
-            Denormalized image array of shape (H, W, C) with values clipped to [0, 1]
-        """
+    Denormalize a normalized image tensor for visualization.
+    """
     img = img_t.detach().cpu().float()
     img = img * std + mean
     img = torch.clamp(img, 0, 1)
     return img.permute(1, 2, 0).numpy()
 
 
-def show_heatmap_per_class(x_images, importance_maps, labels, class_names, n_classes, alpha=0.45, cmap='jet',
-                           save_path=None):
+def show_heatmap_per_class(
+    x_images,
+    importance_maps,
+    labels,
+    class_names,
+    n_classes,
+    alpha=0.45,
+    cmap='jet',
+    save_path=None
+):
     """
     Display Grad-CAM heatmap overlays for one sample from each class.
-    Creates a visualization showing the original image and Grad-CAM heatmap for the first sample of each class.
-
-    Parameters
-    ----------
-    x_images : torch.Tensor
-        Image tensors of shape (N, C, H, W)
-    importance_maps : numpy.ndarray
-        Importance maps of shape (N, H, W) with values in [0, 1]
-    labels : numpy.ndarray
-        Class labels with integer class indices
-    class_names : list of str
-        Names of classes in order corresponding to class indices
-    n_classes : int
-        Total number of classes
-    alpha : float, optional
-        Transparency of heatmap overlay in range [0, 1]
-    cmap : str, optional
-        Matplotlib colormap name for heatmap
-    save_path : str, optional
-        Path to save figure. If None, displays interactively
-
-    Returns
-    -------
-    None
-        Displays or saves the figure
     """
+    import matplotlib.pyplot as plt
+
     fig, axes = plt.subplots(n_classes, 2, figsize=(10, 5 * n_classes))
     if n_classes == 1:
         axes = axes.reshape(1, -1)
 
     for class_idx, class_name in enumerate(class_names):
-        # Find first image of this class
         idx = np.where(labels == class_idx)[0][0]
 
-        # Get image and heatmap
         img = denorm_img(x_images[idx])
         hm = np.clip(importance_maps[idx], 0, 1)
 
-        # Plot original image
         axes[class_idx, 0].imshow(img)
         axes[class_idx, 0].set_title(f'{class_name} - Original')
         axes[class_idx, 0].axis('off')
 
-        # Plot heatmap overlay
         axes[class_idx, 1].imshow(img)
         axes[class_idx, 1].imshow(hm, alpha=alpha, cmap=cmap)
         axes[class_idx, 1].set_title(f'{class_name} - Grad-CAM')
@@ -879,53 +910,29 @@ def show_heatmap_per_class(x_images, importance_maps, labels, class_names, n_cla
     else:
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
 
-    plt.close()
+    plt.close(fig)
 
 
-def show_occlusions_same_idx(x_images, patch_rankings, patch_meta, idx=0, fractions=(0.0, 0.2, 0.4, 0.6, 0.8, 1),
-                             baseline='blur', blur_ksize=31, blur_sigma=7.0, n_cols=3, save_path=None):
+def show_occlusions_same_idx(
+    x_images,
+    patch_rankings,
+    patch_meta,
+    idx=0,
+    fractions=(0.0, 0.2, 0.4, 0.6, 0.8, 1),
+    baseline='blur',
+    blur_ksize=31,
+    blur_sigma=7.0,
+    n_cols=3,
+    save_path=None
+):
     """
-        Visualize progressive occlusion of image regions based on Grad-CAM importance.
+    Visualize progressive occlusion of image regions based on patch rankings.
+    """
+    import matplotlib.pyplot as plt
 
-        Shows how an image looks when increasingly important regions (ranked by
-        Grad-CAM) are occluded using a specified baseline strategy. Helps
-        validate that the importance maps correctly identify critical regions.
-
-        Parameters
-        ----------
-        x_images : torch.Tensor
-            Image tensors of shape (N, C, H, W)
-        patch_rankings : list of numpy.ndarray
-            List of N arrays, each containing patch indices sorted by importance (most important first)
-        patch_meta : dict
-            Dictionary containing patch metadata with keys:
-            - 'patch_size': tuple of (height, width) for patches
-            - Other metadata needed by apply_importance_masking
-        idx : int, optional
-            Index of image to visualize
-        fractions : tuple of float, optional
-            Fractions of image to occlude, values in [0, 1]
-        baseline : str, optional
-            Occlusion strategy
-        blur_ksize : int, optional
-            Kernel size for blur baseline, must be odd
-        blur_sigma : float, optional
-            Sigma parameter for Gaussian blur
-        n_cols : int, optional
-            Number of columns in subplot grid
-        save_path : str, optional
-            Path to save figure. If None, displays interactively
-
-        Returns
-        -------
-        None
-            Displays or saves the figure
-        """
-
-    img0 = x_images[idx:idx+1]
-
+    img0 = x_images[idx:idx + 1]
     n_rows = int(np.ceil(len(fractions) / n_cols))
-    plt.figure(figsize=(4*n_cols, 4*n_rows))
+    fig = plt.figure(figsize=(4 * n_cols, 4 * n_rows))
 
     for j, frac in enumerate(fractions, 1):
         img_occ = apply_importance_masking(
@@ -941,24 +948,24 @@ def show_occlusions_same_idx(x_images, patch_rankings, patch_meta, idx=0, fracti
 
         ax = plt.subplot(n_rows, n_cols, j)
         ax.imshow(denorm_img(img_occ))
-        ax.set_title(f'{int(frac*100)}% occluded')
+        ax.set_title(f'{int(frac * 100)}% occluded')
         ax.axis('off')
 
-    plt.suptitle(
-        'Grad-CAM–guided occlusion (blur baseline)',
-        fontsize=14,
-        y=1.02
-    )
+    plt.suptitle('Grad-CAM–guided occlusion', fontsize=14, y=1.02)
     plt.tight_layout()
     if save_path is None:
         plt.show()
     else:
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
 
-    plt.close()
+    plt.close(fig)
 
 
+# ---- RGA curve helpers ----
 def fill_nan_tail(vec):
+    """
+    Replace the first non-finite value and all following values with 0.0.
+    """
     vec = np.asarray(vec, dtype=float).copy()
     bad = np.where(~np.isfinite(vec))[0]
     if len(bad) > 0:
@@ -967,16 +974,23 @@ def fill_nan_tail(vec):
 
 
 def aurga_from_curve(curve):
+    """
+    Compute area under an RGA curve on a normalized [0, 1] x-axis.
+    """
     curve = fill_nan_tail(curve)
     x = np.linspace(0, 1, len(curve))
-    return auc(x, curve)
+    return float(auc(x, curve))
 
 
 def ideal_prob_matrix(y_labels, class_order):
+    """
+    Build an ideal one-hot probability matrix from labels and class order.
+    """
     y_labels = np.asarray(y_labels)
     class_order = np.asarray(class_order)
-    n = len(y_labels)
-    ideal = np.zeros((n, len(class_order)), dtype=np.float32)
+    ideal = np.zeros((len(y_labels), len(class_order)), dtype=np.float32)
+
     for k, c in enumerate(class_order):
-        ideal[:, k] = (y_labels == c).astype(np.float32)
+        ideal[:, k] = np.equal(y_labels, c).astype(np.float32)
+
     return ideal

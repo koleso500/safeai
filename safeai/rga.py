@@ -1,664 +1,1104 @@
+"""
+Rank Graduation Accuracy (RGA).
+
+Main functions
+--------------
+rga_score
+    Compute one RGA value.
+
+rga_curve
+    Compute an RGA curve and normalized AURGA.
+
+aurga_score
+    Compute only the normalized area under the RGA curve.
+
+compare_rga
+    Compare several models/probability arrays using RGA curves.
+
+plot_rga
+    Plot one RGA curve or a comparison of several RGA curves.
+
+Notes
+-----
+The scalar RGA score is computed consistently across binary and multiclass
+classification.
+
+AURGA depends on the curve-construction method.
+
+For binary classification, the default curve method is 'partial', which uses
+partial contribution decomposition over ranked segments. This gives smoother
+and more stable binary RGA curves.
+
+For multiclass classification, the default curve method is 'removal', which
+progressively removes the most confident samples inside each class and
+recomputes weighted one-vs-rest RGA.
+
+Use curve_method='removal' for binary classification if strict curve-procedure
+consistency with multiclass is required.
+"""
+
+from typing import Any
+
 import numpy as np
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
 
 from safeai.cramer import gini_via_lorenz, cvm1_concordance_weighted
-from safeai.utils import ensure_prob_matrix, fill_nan_tail, aurga_from_curve, ideal_prob_matrix, get_model_probabilities
+from safeai.utils import (
+    ensure_prob_matrix,
+    fill_nan_tail,
+    aurga_from_curve,
+    ideal_prob_matrix,
+    get_model_probabilities
+)
+
+__all__ = [
+    'rga_score',
+    'rga_curve',
+    'aurga_score',
+    'compare_rga',
+    'plot_rga'
+]
 
 
-def rga_cramer(y, yhat, x=None, positive_class=1):
+# ---- Public API ----
+def rga_score(
+    y_true,
+    y_score,
+    *,
+    x=None,
+    class_order=None,
+    positive_class=1,
+    verbose=False
+):
     """
-    RGA using Cramér–von Mises (CvM) distance
-    RGA = 1 - CvM(y, yhat) / G(y)
-
-    yhat can be either:
-    1. Predicted scores/probabilities, e.g. model.predict_proba(x)[:, 1]
-    2. Fitted sklearn estimator or Pipeline, if x is provided
-
-    Examples
-    --------
-    rga_cramer(y_test, y_prob)
-
-    rga_cramer(y_test, pipeline, x=x_test, positive_class=1)
-
-    """
-    if hasattr(yhat, 'predict_proba'):
-        if x is None:
-            raise ValueError('x must be provided when yhat is a model or Pipeline')
-
-        prob = get_model_probabilities(yhat, x)
-
-        if prob.ndim != 2 or prob.shape[1] != 2:
-            raise ValueError('For multiclass models use rga_cramer_multiclass')
-
-        if hasattr(yhat, 'classes_'):
-            classes = list(yhat.classes_)
-            if positive_class not in classes:
-                raise ValueError(f'positive_class={positive_class} not found in classes_: {classes}')
-            pos_idx = classes.index(positive_class)
-        else:
-            pos_idx = 1
-
-        yhat = prob[:, pos_idx]
-
-    y = np.asarray(y, dtype=float).reshape(-1)
-    yhat = np.asarray(yhat, dtype=float).reshape(-1)
-
-    g = gini_via_lorenz(y)
-    if not np.isfinite(g) or g == 0:
-        return np.nan
-
-    cvm = cvm1_concordance_weighted(y, yhat)
-    if not np.isfinite(cvm):
-        return np.nan
-
-    return 1 - cvm / g
-
-
-def partial_rga_cramer(y, yhat, n_segments, x=None, positive_class=1):
-    """
-    Decompose RGA into partial contributions across segments.
-
-    yhat can be either:
-    1. Predicted scores/probabilities, e.g. model.predict_proba(x)[:, 1]
-    2. Fitted sklearn estimator or Pipeline, if x is provided
+    Compute Rank Graduation Accuracy.
 
     Parameters
     ----------
-    y : array-like
-        True values.
-    yhat : array-like or fitted sklearn estimator/Pipeline
-        Predicted values, or a model/Pipeline with predict_proba.
-    n_segments : int
-        Number of segments to decompose into.
+    y_true : array-like, shape (n_samples,)
+        True labels.
+
+    y_score : array-like or fitted model
+        One of:
+        - binary score/probability vector, shape (n_samples,)
+        - probability matrix, shape (n_samples, n_classes)
+        - fitted sklearn estimator or Pipeline with predict_proba
+
     x : array-like or DataFrame, optional
-        Input features. Required when yhat is a model or Pipeline.
+        Input features. Required if y_score is a fitted model.
+
+    class_order : array-like, optional
+        Order of probability columns. For sklearn models this is usually
+        ``model.classes_``.
+
     positive_class : int or str, default=1
-        Positive class label for binary classification.
+        Positive class for binary classification.
+
+    verbose : bool, default=False
+        Whether to print additional information.
+
+    Returns
+    -------
+    float
+        RGA score.
+    """
+    y_true = np.asarray(y_true)
+
+    scores, classes, task = _prepare_scores(
+        y_score,
+        x=x,
+        y_true=y_true,
+        class_order=class_order,
+        positive_class=positive_class
+    )
+
+    if task == 'binary':
+        return _binary_rga_score(y_true, scores)
+
+    result = _multiclass_rga_score(
+        y_true,
+        scores,
+        class_order=classes,
+        verbose=verbose
+    )
+
+    return result['rga']
+
+
+def rga_curve(
+    y_true,
+    y_score,
+    *,
+    x=None,
+    class_order=None,
+    positive_class=1,
+    n_segments=10,
+    curve_method='auto',
+    normalize_to_perfect=True,
+    verbose=False
+):
+    """
+    Compute an RGA curve and normalized AURGA.
+
+    Parameters
+    ----------
+    y_true : array-like, shape (n_samples,)
+        True labels.
+
+    y_score : array-like or fitted model
+        One of:
+        - binary score/probability vector, shape (n_samples,)
+        - probability matrix, shape (n_samples, n_classes)
+        - fitted sklearn estimator or Pipeline with predict_proba
+
+    x : array-like or DataFrame, optional
+        Input features. Required if y_score is a fitted model.
+
+    class_order : array-like, optional
+        Order of probability columns.
+
+    positive_class : int or str, default=1
+        Positive class for binary classification.
+
+    n_segments : int, default=10
+        Number of curve segments.
+
+    curve_method : {'auto', 'partial', 'removal'}, default='auto'
+        Method used to construct the RGA curve.
+
+        - 'auto':
+            binary -> 'partial'
+            multiclass -> 'removal'
+
+        - 'partial':
+            Partial contribution decomposition.
+            Currently supported only for binary classification.
+
+        - 'removal':
+            Progressively remove high-confidence samples and recompute RGA.
+
+    normalize_to_perfect : bool, default=True
+        If True, return normalized AURGA as the main 'aurga'.
+
+    verbose : bool, default=False
+        Whether to print additional information.
 
     Returns
     -------
     dict
         Dictionary containing:
-        - 'full_rga': RGA score
-        - 'partial_rga': Partial RGA contributions for each segment
-        - 'cumulative_vector': Cumulative vector [RGA, RGA-RGA_1, ..., 0]
-        - 'segment_indices': List of index ranges for each segment
-
+        - task
+        - curve_method
+        - rga
+        - x
+        - curve
+        - aurga
+        - aurga_raw
+        - aurga_perfect, when available
+        - perfect_curve, when available
+        - per_class_rga, only for multiclass
+        - class_weights, only for multiclass
+        - classes, only for multiclass
     """
-    if hasattr(yhat, 'predict_proba'):
-        if x is None:
-            raise ValueError('x must be provided when yhat is a model or Pipeline')
+    _validate_n_segments(n_segments)
+    _validate_curve_method(curve_method)
 
-        prob = get_model_probabilities(yhat, x)
+    y_true = np.asarray(y_true)
 
-        if prob.ndim != 2 or prob.shape[1] != 2:
-            raise ValueError('For multiclass models use partial_rga_cramer_multiclass')
+    scores, classes, task = _prepare_scores(
+        y_score,
+        x=x,
+        y_true=y_true,
+        class_order=class_order,
+        positive_class=positive_class
+    )
 
-        if hasattr(yhat, 'classes_'):
-            classes = list(yhat.classes_)
-            if positive_class not in classes:
-                raise ValueError(
-                    f'positive_class={positive_class} not found in classes_: {classes}'
-                )
-            pos_idx = classes.index(positive_class)
-        else:
-            pos_idx = 1
+    resolved_method = _resolve_curve_method(task, curve_method)
 
-        yhat = prob[:, pos_idx]
+    if task == 'binary':
+        if resolved_method == 'partial':
+            return _binary_rga_curve_partial(
+                y_true,
+                scores,
+                n_segments=n_segments,
+                normalize_to_perfect=normalize_to_perfect
+            )
 
-    y = np.asarray(y, dtype=float).reshape(-1)
-    yhat = np.asarray(yhat, dtype=float).reshape(-1)
-    mask = ~np.isnan(y) & ~np.isnan(yhat)
-    y = y[mask]
-    yhat = yhat[mask]
+        return _binary_rga_curve_removal(
+            y_true,
+            scores,
+            n_segments=n_segments,
+            normalize_to_perfect=normalize_to_perfect
+        )
 
-    n = len(y)
-    if n == 0:
-        return {
-            'full_rga': np.nan,
-            'partial_rga': np.array([]),
-            'cumulative_vector': np.array([]),
-            'segment_indices': []
-        }
+    if resolved_method == 'partial':
+        raise ValueError(
+            "curve_method='partial' is currently supported only for "
+            "binary classification."
+        )
 
-    # Calculate full RGA
-    full_rga = rga_cramer(y, yhat)
-    full_gini = gini_via_lorenz(y)
-
-    if not np.isfinite(full_rga) or not np.isfinite(full_gini) or full_gini == 0:
-        return {
-            'full_rga': full_rga,
-            'partial_rga': np.array([np.nan] * n_segments),
-            'cumulative_vector': np.array([np.nan] * (n_segments + 1)),
-            'segment_indices': []
-        }
-
-    # Sort by predictions (descending)
-    ord_yhat_desc = np.argsort(yhat)[::-1]
-    y_sorted = y[ord_yhat_desc]
-    yhat_sorted = yhat[ord_yhat_desc]
-
-    # Divide into segments
-    segment_size = n // n_segments
-    remainder = n % n_segments
-
-    partial_rga = []
-    segment_indices = []
-
-    start_idx = 0
-    for k in range(n_segments):
-        # Remainder across first segments
-        current_size = segment_size + (1 if k < remainder else 0)
-        end_idx = start_idx + current_size
-
-        segment_indices.append((start_idx, end_idx))
-
-        # Extract segment
-        y_segment = y_sorted[start_idx:end_idx]
-        yhat_segment = yhat_sorted[start_idx:end_idx]
-
-        # Calculate RGA for this segment
-        segment_rga = rga_cramer(y_segment, yhat_segment)
-
-        # Weight by segment's contribution to total Gini
-        segment_gini = gini_via_lorenz(y_segment)
-
-        if np.isfinite(segment_rga) and np.isfinite(segment_gini) and segment_gini > 0:
-            weight = len(y_segment) / n
-            weighted_contribution = segment_rga * segment_gini * weight / full_gini
-        else:
-            weighted_contribution = 0.0
-
-        partial_rga.append(weighted_contribution)
-        start_idx = end_idx
-
-    partial_rga = np.array(partial_rga)
-
-    # Normalize
-    sum_partial = np.sum(partial_rga)
-    if sum_partial > 0:
-        partial_rga = partial_rga * (full_rga / sum_partial)
-
-    # Build cumulative vector
-    cumulative_vector = np.zeros(n_segments + 1)
-    cumulative_vector[0] = full_rga
-
-    cumsum = 0.0
-    for k in range(n_segments):
-        cumsum += partial_rga[k]
-        cumulative_vector[k + 1] = full_rga - cumsum
-
-    return {
-        'full_rga': full_rga,
-        'partial_rga': partial_rga,
-        'cumulative_vector': cumulative_vector,
-        'segment_indices': segment_indices
-    }
+    return _multiclass_rga_curve_removal(
+        y_true,
+        scores,
+        class_order=classes,
+        n_segments=n_segments,
+        normalize_to_perfect=normalize_to_perfect,
+        verbose=verbose
+    )
 
 
-def compare_models_rga_binary(models_dict, y, x_test=None, positive_class=1,
-                              n_segments=10, fig_size=(12, 5),
-                              verbose=True, save_path=None):
+def aurga_score(
+    y_true,
+    y_score,
+    *,
+    x=None,
+    class_order=None,
+    positive_class=1,
+    n_segments=10,
+    curve_method='auto',
+    normalize_to_perfect=True,
+    verbose=False
+):
     """
-    Compare binary classifiers using RGA
+    Compute only the area under the RGA curve.
+
+    By default, this returns normalized AURGA.
+    """
+    result = rga_curve(
+        y_true,
+        y_score,
+        x=x,
+        class_order=class_order,
+        positive_class=positive_class,
+        n_segments=n_segments,
+        curve_method=curve_method,
+        normalize_to_perfect=normalize_to_perfect,
+        verbose=verbose
+    )
+
+    return result['aurga']
+
+
+def compare_rga(
+    models,
+    y_true,
+    *,
+    x=None,
+    n_segments=10,
+    positive_class=1,
+    curve_method='auto',
+    normalize_to_perfect=True,
+    save_path=None,
+    show=False,
+    verbose=True
+):
+    """
+    Compare multiple models or probability arrays using RGA curves.
 
     Parameters
     ----------
-    models_dict : dict
-        Either:
-        - {'Model name': y_score_array}
-        - {'Model name': fitted sklearn estimator or Pipeline}
+    models : dict
+        Dictionary where values can be:
+        - score array
+        - probability matrix
+        - fitted model with predict_proba
+        - tuple of (probability_matrix, class_order)
 
-        If fitted models/Pipelines are passed, x_test must be provided.
+    y_true : array-like
+        True labels.
 
-    y : array-like
-        True binary labels.
-    x_test : array-like or DataFrame, optional
-        Test features, required when models_dict contains fitted models/Pipelines
+    x : array-like or DataFrame, optional
+        Required if model objects are passed.
+
+    n_segments : int, default=10
+        Number of curve segments.
+
     positive_class : int or str, default=1
-        Positive class used for probability extraction
-    n_segments : int
-        Number of segments for partial RGA
-    fig_size : tuple, default=(14, 6)
-        Figure size for the comparison plot
-    verbose : bool, default=True
-        If True, print the RGA score for each model
+        Positive class for binary classification.
+
+    curve_method : {'auto', 'partial', 'removal'}, default='auto'
+        Method used to construct RGA curves.
+
+    normalize_to_perfect : bool, default=True
+        If True, return normalized AURGA as the main 'aurga' value.
+
     save_path : str or None, default=None
-        If provided, saves the comparison plot to this path
-        If None, displays the plot interactively
+        If provided, save the comparison plot to this path.
+
+    show : bool, default=False
+        If True, display the comparison plot with plt.show().
+
+    verbose : bool, default=True
+        Whether to print summary.
+
+    Returns
+    -------
+    dict
+        Mapping from model name to RGA curve result.
     """
     results = {}
 
-    plt.figure(figsize=fig_size)
-    cmap = plt.get_cmap('tab10')
-    colors = cmap(np.linspace(0, 1, len(models_dict)))
-
-    for (model_name, yhat_or_model), color in zip(models_dict.items(), colors):
+    for model_name, model_or_scores in models.items():
         if verbose:
-            print(f"\nEvaluating {model_name}...")
+            print(f'Evaluating {model_name}...')
 
-        res = partial_rga_cramer(
-            y,
-            yhat_or_model,
+        scores, class_order = _unpack_model_value(model_or_scores)
+
+        result = rga_curve(
+            y_true,
+            scores,
+            x=x,
+            class_order=class_order,
+            positive_class=positive_class,
             n_segments=n_segments,
-            x=x_test,
-            positive_class=positive_class
+            curve_method=curve_method,
+            normalize_to_perfect=normalize_to_perfect,
+            verbose=False
         )
 
-        results[model_name] = res
+        results[model_name] = result
 
-        x_axis = np.linspace(0, 1, n_segments + 1)
-        plt.plot(
-            x_axis,
-            res['cumulative_vector'],
+        if verbose:
+            rga = result.get('rga', np.nan)
+            aurga = result.get('aurga', np.nan)
+            aurga_raw = result.get('aurga_raw', np.nan)
+            method = result.get('curve_method', 'unknown')
+
+            print(
+                f'{model_name}: '
+                f'RGA={rga:.4f}, AURGA={aurga:.4f}, '
+                f'AURGA_raw={aurga_raw:.4f}, method={method}'
+            )
+
+    if save_path is not None or show:
+        plot_rga(results, save_path=save_path, show=show)
+
+    return results
+
+
+def plot_rga(
+    result,
+    *,
+    model_name='Model',
+    fig_size=(12, 5),
+    save_path=None,
+    show=False
+):
+    """
+    Plot one RGA curve or several RGA curves.
+
+    Parameters
+    ----------
+    result : dict
+        Either:
+        - result from rga_curve(...)
+        - results from compare_rga(...)
+
+    model_name : str, default='Model'
+        Used only when plotting one curve.
+
+    fig_size : tuple, default=(12, 5)
+        Figure size.
+
+    save_path : str or None, default=None
+        If provided, save the plot.
+
+    show : bool, default=False
+        If True, display the plot with plt.show().
+
+    Returns
+    -------
+    str or tuple
+        If save_path is provided and show is False, returns save_path.
+        Otherwise, returns (fig, ax).
+    """
+    if save_path is not None and not show:
+        import matplotlib
+        matplotlib.use('Agg')
+
+    import matplotlib.pyplot as plt
+
+    if _is_single_rga_result(result):
+        results = {model_name: result}
+        title = 'RGA Curve'
+    else:
+        results = result
+        title = 'RGA Curves Comparison'
+
+    fig, ax = plt.subplots(figsize=fig_size)
+
+    cmap = plt.get_cmap('tab10')
+    colors = cmap(np.linspace(0, 1, len(results)))
+
+    for (name, res), color in zip(results.items(), colors):
+        ax.plot(
+            res['x'],
+            res['curve'],
             '-o',
             linewidth=2.3,
             markersize=4.5,
             color=color,
-            label=f"{model_name} (RGA={res['full_rga']:.3f})"
+            label=_curve_label(name, res)
         )
 
-        if verbose:
-            print(f"{model_name}: RGA={res['full_rga']:.4f}")
+        if len(results) == 1 and 'perfect_curve' in res:
+            ax.plot(
+                res['x'],
+                res['perfect_curve'],
+                '--',
+                linewidth=2.0,
+                color=color,
+                alpha=0.6,
+                label='Perfect'
+            )
 
-    plt.xlabel('Fraction of Data Removed', fontsize=11, fontweight='bold')
-    plt.ylabel('RGA Score', fontsize=11, fontweight='bold')
-    plt.title('Binary RGA Curves Comparison', fontsize=12, fontweight='bold')
-    plt.grid(alpha=0.3, linestyle='--')
-    plt.xlim([0, 1])
-    plt.legend(fontsize=9)
-    plt.tight_layout()
+    ax.set_xlabel('Fraction of Data Removed', fontsize=11, fontweight='bold')
+    ax.set_ylabel('RGA Score', fontsize=11, fontweight='bold')
+    ax.set_title(title, fontsize=12, fontweight='bold')
+    ax.grid(alpha=0.3, linestyle='--')
+    ax.set_xlim([0, 1])
+    ax.legend(fontsize=9)
 
-    if save_path is None:
+    fig.tight_layout()
+
+    if save_path is not None:
+        fig.savefig(save_path, dpi=300, bbox_inches='tight')
+
+    if show:
         plt.show()
-    else:
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        return fig, ax
 
-    plt.close()
+    if save_path is not None:
+        plt.close(fig)
+        return save_path
 
-    return results
+    return fig, ax
 
 
-def rga_cramer_multiclass(y_labels, prob_matrix, class_order=None, verbose=False):
+# ---- Input handling helpers ----
+def _prepare_scores(
+    y_score,
+    *,
+    x=None,
+    y_true=None,
+    class_order=None,
+    positive_class=1
+):
     """
-    Calculate RGA for multiclass classification using one-vs-rest approach.
-
-    Parameters
-    ----------
-    y_labels : array-like
-        True class labels
-    prob_matrix : array-like, shape (n_samples, n_classes)
-        Predicted probabilities for each class.
-        Columns must correspond to `class_order` if provided,
-        or to sorted unique classes in y_labels if not.
-    class_order : array-like, optional
-        Order of classes corresponding to prob_matrix columns (.classes_).
-        If None, assumes prob_matrix columns match sorted unique(y_labels).
-    verbose : bool, optional
-        Print detailed information
+    Convert user input into a clean score representation.
 
     Returns
     -------
-    tuple
-        (rga_weighted, rga_per_class, class_weights, classes_used)
-        - rga_weighted: Overall weighted RGA score
-        - rga_per_class: RGA score for each class
-        - class_weights: Weight of each class
-        - classes_used: The class order used for computation
-    """
-    y_labels = np.asarray(y_labels)
+    scores : np.ndarray
+        Either:
+        - binary score vector, shape (n_samples,)
+        - multiclass probability matrix, shape (n_samples, n_classes)
 
-    # Determine class order
+    classes : np.ndarray or None
+        Class order for multiclass.
+
+    task : str
+        Either 'binary' or 'multiclass'.
+    """
+    model = y_score
+
+    if hasattr(model, 'predict_proba'):
+        if x is None:
+            raise ValueError('x must be provided when y_score is a fitted model.')
+
+        probabilities = get_model_probabilities(model, x)
+
+        if class_order is None and hasattr(model, 'classes_'):
+            class_order = np.asarray(model.classes_)
+
+        y_score = probabilities
+
+    y_score = np.asarray(y_score)
+
+    if y_score.ndim == 1:
+        _, clean_score = _clean_binary_inputs(y_true, y_score)
+        return clean_score, None, 'binary'
+
+    if y_score.ndim != 2:
+        raise ValueError(
+            'y_score must be either a 1D score vector, '
+            'a 2D probability matrix, or a fitted model with predict_proba.'
+        )
+
     if class_order is None:
-        if verbose:
-            print('WARNING: class_order is not provided. Assuming prob_matrix columns match sorted unique classes.')
-        class_order = np.unique(y_labels)
+        if y_true is None:
+            raise ValueError(
+                'class_order must be provided for probability matrices '
+                'when y_true is not available.'
+            )
+        class_order = np.unique(y_true)
     else:
         class_order = np.asarray(class_order)
 
-    prob_matrix = ensure_prob_matrix(prob_matrix, class_order)
+    y_score = ensure_prob_matrix(y_score, class_order)
 
-    n_classes = len(class_order)
-
-    # Validate dimensions
-    if prob_matrix.shape[1] != n_classes:
+    if y_score.shape[1] != len(class_order):
         raise ValueError(
-            f'prob_matrix has {prob_matrix.shape[1]} columns but class_order has {n_classes} classes.'
+            f'Probability matrix has {y_score.shape[1]} columns, '
+            f'but class_order has {len(class_order)} classes.'
         )
 
-    rgas = []
-    weights = []
+    if y_score.shape[1] == 2:
+        classes_list = list(class_order)
 
-    for k, c in enumerate(class_order):
-        # One-vs-rest encoding
-        y_bin = np.equal(y_labels, c).astype(np.float32)
-        yhat_c = prob_matrix[:, k]
+        if positive_class in classes_list:
+            pos_idx = classes_list.index(positive_class)
+        else:
+            pos_idx = 1
 
-        if np.sum(y_bin) == 0:
-            if verbose:
-                print(f'Warning: Class {c} has zero samples. Skipping.')
-            rgas.append(0.0)
-            weights.append(0.0)
-            continue
+        _, clean_score = _clean_binary_inputs(y_true, y_score[:, pos_idx])
+        return clean_score, class_order, 'binary'
 
-        rga_k = rga_cramer(y_bin, yhat_c)
-        rgas.append(rga_k)
-        weights.append(np.mean(y_bin))
-
-    rgas = np.array(rgas)
-    weights = np.array(weights)
-
-    # Weighted average
-    denom = np.nansum(weights)
-    rga_weighted = np.nansum(rgas * weights) / denom if denom > 0 else np.nan
-
-    return rga_weighted, rgas, weights, class_order
+    _, clean_prob = _clean_multiclass_inputs(y_true, y_score)
+    return clean_prob, class_order, 'multiclass'
 
 
-def rga_curve_multiclass(y_labels, prob_matrix, class_order, n_segments=10):
+def _unpack_model_value(value):
     """
-    Removes top-x most confident samples within each class and
-    recomputes multiclass OvR RGA on the union of remaining samples
+    Allow compare_rga values to be either:
+    - scores
+    - model
+    - (scores, class_order)
     """
-    y_labels = np.asarray(y_labels)
-    classes = np.asarray(class_order)
-    p = ensure_prob_matrix(prob_matrix, classes)
+    if isinstance(value, tuple) and len(value) == 2:
+        return value[0], value[1]
+
+    return value, None
+
+
+def _clean_binary_inputs(y_true, y_score):
+    """
+    Validate and clean binary inputs.
+    """
+    y_true = np.asarray(y_true, dtype=float).reshape(-1)
+    y_score = np.asarray(y_score, dtype=float).reshape(-1)
+
+    if len(y_true) != len(y_score):
+        raise ValueError(
+            f'y_true and y_score must have the same length. '
+            f'Got {len(y_true)} and {len(y_score)}.'
+        )
+
+    mask = np.isfinite(y_true) & np.isfinite(y_score)
+
+    return y_true[mask], y_score[mask]
+
+
+def _clean_multiclass_inputs(y_true, prob_matrix):
+    """
+    Validate and clean multiclass inputs.
+    """
+    y_true = np.asarray(y_true).reshape(-1)
+    prob_matrix = np.asarray(prob_matrix, dtype=float)
+
+    if len(y_true) != prob_matrix.shape[0]:
+        raise ValueError(
+            f'y_true and prob_matrix must have the same number of rows. '
+            f'Got {len(y_true)} and {prob_matrix.shape[0]}.'
+        )
+
+    mask = np.isfinite(prob_matrix).all(axis=1)
+
+    return y_true[mask], prob_matrix[mask]
+
+
+# ---- Curve method helpers ----
+def _validate_n_segments(n_segments):
+    """
+    Validate number of segments.
+    """
+    if not isinstance(n_segments, int):
+        raise TypeError('n_segments must be an integer.')
+
+    if n_segments < 1:
+        raise ValueError('n_segments must be at least 1.')
+
+
+def _validate_curve_method(curve_method):
+    """
+    Validate curve method.
+    """
+    valid_methods = {'auto', 'partial', 'removal'}
+
+    if curve_method not in valid_methods:
+        raise ValueError(
+            f'curve_method must be one of {valid_methods}. '
+            f'Got {curve_method}.'
+        )
+
+
+def _resolve_curve_method(task, curve_method):
+    """
+    Resolve automatic curve method.
+
+    Defaults
+    --------
+    binary:
+        'partial'
+
+    multiclass:
+        'removal'
+    """
+    if curve_method != 'auto':
+        return curve_method
+
+    if task == 'binary':
+        return 'partial'
+
+    return 'removal'
+
+
+# ---- Binary helpers ----
+def _binary_rga_score(y_true, y_score):
+    """
+    Binary or numeric RGA based on CvM distance.
+
+    RGA = 1 - CvM(y_true, y_score) / Gini(y_true)
+    """
+    y_true, y_score = _clean_binary_inputs(y_true, y_score)
+
+    if len(y_true) == 0:
+        return np.nan
+
+    gini = gini_via_lorenz(y_true)
+
+    if not np.isfinite(gini) or gini == 0:
+        return np.nan
+
+    cvm = cvm1_concordance_weighted(y_true, y_score)
+
+    if not np.isfinite(cvm):
+        return np.nan
+
+    return float(1 - cvm / gini)
+
+
+def _binary_rga_curve_partial(
+    y_true,
+    y_score,
+    *,
+    n_segments,
+    normalize_to_perfect=True
+):
+    """
+    Binary RGA curve using partial RGA contribution decomposition.
+
+    This is the default binary curve because it is smoother and more stable
+    than removal-based recomputation for binary classification.
+    """
+    y_true, y_score = _clean_binary_inputs(y_true, y_score)
+
+    x_axis = np.linspace(0, 1, n_segments + 1)
+    n = len(y_true)
+
+    if n == 0:
+        return {
+            'task': 'binary',
+            'curve_method': 'partial',
+            'rga': np.nan,
+            'x': x_axis,
+            'curve': np.full(n_segments + 1, np.nan),
+            'partial': np.full(n_segments, np.nan),
+            'aurga': np.nan,
+            'aurga_raw': np.nan,
+            'segment_indices': []
+        }
+
+    full_rga = _binary_rga_score(y_true, y_score)
+    full_gini = gini_via_lorenz(y_true)
+
+    if not np.isfinite(full_rga) or not np.isfinite(full_gini) or full_gini == 0:
+        return {
+            'task': 'binary',
+            'curve_method': 'partial',
+            'rga': full_rga,
+            'x': x_axis,
+            'curve': np.full(n_segments + 1, np.nan),
+            'partial': np.full(n_segments, np.nan),
+            'aurga': np.nan,
+            'aurga_raw': np.nan,
+            'segment_indices': []
+        }
+
+    order = np.argsort(y_score)[::-1]
+    y_sorted = y_true[order]
+    score_sorted = y_score[order]
+
+    segments = _make_segments(n, n_segments)
+
+    partial = []
+    segment_indices = []
+
+    for start, end in segments:
+        segment_indices.append((start, end))
+
+        y_segment = y_sorted[start:end]
+        score_segment = score_sorted[start:end]
+
+        segment_rga = _binary_rga_score(y_segment, score_segment)
+        segment_gini = gini_via_lorenz(y_segment)
+
+        if (
+            np.isfinite(segment_rga)
+            and np.isfinite(segment_gini)
+            and segment_gini > 0
+        ):
+            weight = len(y_segment) / n
+            contribution = segment_rga * segment_gini * weight / full_gini
+        else:
+            contribution = 0.0
+
+        partial.append(contribution)
+
+    partial = np.asarray(partial, dtype=float)
+    partial_sum = np.sum(partial)
+
+    if partial_sum > 0:
+        partial = partial * (full_rga / partial_sum)
+
+    curve = np.zeros(n_segments + 1, dtype=float)
+    curve[0] = full_rga
+
+    removed = 0.0
+    for i in range(n_segments):
+        removed += partial[i]
+        curve[i + 1] = full_rga - removed
+
+    curve = fill_nan_tail(curve)
+    aurga_raw = float(aurga_from_curve(curve))
+
+    result = {
+        'task': 'binary',
+        'curve_method': 'partial',
+        'rga': float(full_rga),
+        'x': x_axis,
+        'curve': curve,
+        'partial': partial,
+        'aurga': aurga_raw,
+        'aurga_raw': aurga_raw,
+        'segment_indices': segment_indices
+    }
+
+    if normalize_to_perfect:
+        perfect_scores = _ideal_binary_scores(y_true)
+
+        perfect_result: dict[str, Any] = _binary_rga_curve_partial(
+            y_true,
+            perfect_scores,
+            n_segments=n_segments,
+            normalize_to_perfect=False
+        )
+
+        perfect_curve = perfect_result['curve']
+        perfect_aurga = float(perfect_result['aurga_raw'])
+        aurga_normalized = _safe_normalize_area(aurga_raw, perfect_aurga)
+
+        result['perfect_curve'] = perfect_curve
+        result['aurga_perfect'] = perfect_aurga
+        result['aurga'] = aurga_normalized
+
+    return result
+
+
+def _binary_rga_curve_removal(
+    y_true,
+    y_score,
+    *,
+    n_segments,
+    normalize_to_perfect=True
+):
+    """
+    Binary RGA curve by removal and recomputation.
+
+    This method is available for methodological consistency with multiclass
+    curves, but it may produce less smooth binary curves.
+    """
+    y_true, y_score = _clean_binary_inputs(y_true, y_score)
 
     x_axis = np.linspace(0, 1, n_segments + 1)
     curve = np.zeros_like(x_axis, dtype=float)
 
-    col_of_class = {int(c): int(k) for k, c in enumerate(classes)}
-    idx_by_class = {int(c): np.where(y_labels == c)[0] for c in classes}
+    full_rga = _binary_rga_score(y_true, y_score)
+    n = len(y_true)
 
-    for i, frac in enumerate(x_axis):
-        keep_all = []
+    if n == 0:
+        curve[:] = np.nan
+        aurga_raw = np.nan
+    else:
+        order = np.lexsort((np.arange(n), -y_score))
 
-        for c in classes:
-            c_int = int(c)
-            idx_c = idx_by_class[c_int]
-            n_c = len(idx_c)
-            if n_c == 0:
+        for i, frac in enumerate(x_axis):
+            n_remove = int(np.floor(frac * n))
+            keep = order[n_remove:]
+
+            if len(keep) < 2:
+                curve[i] = 0.0
                 continue
 
-            k = col_of_class[c_int]
-            conf_c = p[idx_c, k]
+            value = _binary_rga_score(y_true[keep], y_score[keep])
+            curve[i] = float(value) if np.isfinite(value) else 0.0
 
-            order_c = idx_c[np.lexsort((idx_c, -conf_c))]
+        curve = fill_nan_tail(curve)
+        aurga_raw = float(aurga_from_curve(curve))
 
-            m_c = int(np.floor(frac * n_c))
-            keep_c = order_c[m_c:]
-            keep_all.append(keep_c)
+    result = {
+        'task': 'binary',
+        'curve_method': 'removal',
+        'rga': full_rga,
+        'x': x_axis,
+        'curve': curve,
+        'aurga': aurga_raw,
+        'aurga_raw': aurga_raw
+    }
 
-        keep = np.concatenate(keep_all) if keep_all else np.array([], dtype=int)
+    if normalize_to_perfect:
+        perfect_scores = _ideal_binary_scores(y_true)
 
-        if len(keep) < 2:
-            curve[i] = 0.0
+        perfect_result: dict[str, Any] = _binary_rga_curve_removal(
+            y_true,
+            perfect_scores,
+            n_segments=n_segments,
+            normalize_to_perfect=False
+        )
+
+        perfect_curve = perfect_result['curve']
+        perfect_aurga = float(perfect_result['aurga_raw'])
+        aurga_normalized = _safe_normalize_area(aurga_raw, perfect_aurga)
+
+        result['perfect_curve'] = perfect_curve
+        result['aurga_perfect'] = perfect_aurga
+        result['aurga'] = aurga_normalized
+
+    return result
+
+
+def _ideal_binary_scores(y_true):
+    """
+    Ideal binary scores.
+
+    For binary labels this is simply y_true itself. This means positive
+    observations receive the highest score.
+    """
+    y_true = np.asarray(y_true, dtype=float).reshape(-1)
+    return y_true.copy()
+
+
+def _make_segments(n, n_segments):
+    """
+    Make approximately equal index segments.
+    """
+    segment_size = n // n_segments
+    remainder = n % n_segments
+
+    segments = []
+    start = 0
+
+    for i in range(n_segments):
+        current_size = segment_size + (1 if i < remainder else 0)
+        end = start + current_size
+        segments.append((start, end))
+        start = end
+
+    return segments
+
+
+# ---- Multiclass helpers ----
+def _multiclass_rga_score(
+    y_true,
+    prob_matrix,
+    *,
+    class_order,
+    verbose=False
+):
+    """
+    Weighted one-vs-rest multiclass RGA.
+    """
+    y_true, prob_matrix = _clean_multiclass_inputs(y_true, prob_matrix)
+    class_order = np.asarray(class_order)
+
+    rgas = []
+    weights = []
+
+    for k, cls in enumerate(class_order):
+        y_binary = np.equal(y_true, cls).astype(float)
+        score_cls = prob_matrix[:, k]
+
+        if np.sum(y_binary) == 0:
+            if verbose:
+                print(f'Warning: class {cls} has no samples. Skipping.')
+            rgas.append(np.nan)
+            weights.append(0.0)
             continue
 
-        y_rem = y_labels[keep]
-        p_rem = p[keep, :]
+        rga_cls = _binary_rga_score(y_binary, score_cls)
 
-        rga_full, _, _, _ = rga_cramer_multiclass(
-            y_rem, p_rem, class_order=classes, verbose=False
-        )
-        curve[i] = 0.0 if not np.isfinite(rga_full) else float(rga_full)
+        rgas.append(rga_cls)
+        weights.append(np.mean(y_binary))
 
-    curve = fill_nan_tail(curve)
-    aurga_val = aurga_from_curve(curve)
-    return x_axis, curve, aurga_val
+    rgas = np.asarray(rgas, dtype=float)
+    weights = np.asarray(weights, dtype=float)
 
+    denom = np.nansum(weights)
 
-def partial_rga_cramer_multiclass(y_labels, prob_matrix, n_segments, class_order=None, verbose=False):
-    """
-    Calculate partial RGA curves for multiclass classification.
-
-    Parameters
-    ----------
-    y_labels : array-like
-        True class labels
-    prob_matrix : array-like, shape (n_samples, n_classes)
-        Predicted probabilities for each class.
-    n_segments : int
-        Number of segments for partial decomposition
-    class_order : array-like, optional
-        Order of classes corresponding to prob_matrix columns.
-    verbose : bool, optional
-        Print detailed information
-
-    Returns
-    -------
-    dict
-        Dictionary containing:
-        - 'cumulative_vector': Weighted average cumulative vector
-        - 'per_class_vectors': Cumulative vectors for each class
-        - 'class_weights': Weight of each class
-        - 'classes': Class order used
-    """
-    y_labels = np.asarray(y_labels)
-
-    # Determine class order
-    if class_order is None:
-        if verbose:
-            print('WARNING: class_order is not provided. Assuming prob_matrix columns match sorted unique classes.')
-        class_order = np.unique(y_labels)
+    if denom > 0:
+        weighted_rga = np.nansum(rgas * weights) / denom
     else:
-        class_order = np.asarray(class_order)
-
-    prob_matrix = ensure_prob_matrix(prob_matrix, class_order)
-
-    cum_vectors = []
-    class_weights = []
-
-    for k, c in enumerate(class_order):
-        y_bin = np.equal(y_labels, c).astype(np.float32)
-        yhat_c = prob_matrix[:, k]
-
-        res = partial_rga_cramer(y_bin, yhat_c, n_segments)
-        cum_vectors.append(res['cumulative_vector'])
-        class_weights.append(np.mean(y_bin))
-
-    cum_vectors = np.vstack(cum_vectors)
-    class_weights = np.array(class_weights)
-
-    # Weighted average across classes
-    weighted_curve = np.average(cum_vectors, weights=class_weights, axis=0)
+        weighted_rga = np.nan
 
     return {
-        'cumulative_vector': weighted_curve,
-        'per_class_vectors': cum_vectors,
-        'class_weights': class_weights,
+        'rga': float(weighted_rga) if np.isfinite(weighted_rga) else np.nan,
+        'per_class_rga': rgas,
+        'class_weights': weights,
         'classes': class_order
     }
 
 
-# Evaluation Function
-def evaluate_rga_multiclass(y_labels, prob_matrix, class_order=None, n_segments=10,
-                            model_name='Model', plot=True, fig_size=(12, 5),
-                            verbose=True, save_path=None):
+def _multiclass_rga_curve_removal(
+    y_true,
+    prob_matrix,
+    *,
+    class_order,
+    n_segments,
+    normalize_to_perfect=True,
+    verbose=False
+):
     """
-    RGA evaluation for multiclass classification.
+    Multiclass RGA curve by class-wise removal and recomputation.
 
-    Parameters
-    ----------
-    y_labels : array-like
-        True class labels
-    prob_matrix : array-like, shape (n_samples, n_classes)
-        Predicted probabilities for each class
-    class_order : array-like, optional
-        Order of classes corresponding to prob_matrix columns.
-        For sklearn models, pass `model.classes_`.
-        For PyTorch models, pass the class order used in output layer, like np.array([0, 1, 2, ...]).
-    n_segments : int, optional
-        Number of segments for partial RGA decomposition
-    model_name : str, optional
-        Name of the model for display
-    plot : bool, optional
-        Whether to generate visualization
-    fig_size : tuple, optional
-        Figure size for plots
-    verbose : bool, optional
-        Print detailed results
-    save_path :
-        Path for saving the plot
-
-    Returns
-    -------
-    dict
-        Comprehensive results dictionary containing:
-        - 'rga_full': Overall RGA score
-        - 'rga_per_class': RGA for each class
-        - 'class_weights': Weight of each class
-        - 'aurga': Area under RGA curve
-        - 'cumulative_vector': Cumulative RGA vector
-        - 'per_class_vectors': Per-class cumulative vectors
-        - 'classes': Class order used
+    At each step:
+    1. For every true class, rank its samples by predicted probability
+       for that class.
+    2. Remove the most confident samples inside each class.
+    3. Recompute weighted one-vs-rest RGA on the remaining data.
     """
-    # Scalar RGA at full data (same as old)
-    rga_full, rga_per_class, class_weights, classes_used = rga_cramer_multiclass(
-        y_labels, prob_matrix, class_order=class_order, verbose=verbose
+    y_true, prob_matrix = _clean_multiclass_inputs(y_true, prob_matrix)
+    class_order = np.asarray(class_order)
+
+    x_axis = np.linspace(0, 1, n_segments + 1)
+    curve = np.zeros_like(x_axis, dtype=float)
+
+    full = _multiclass_rga_score(
+        y_true,
+        prob_matrix,
+        class_order=class_order,
+        verbose=verbose
     )
 
-    # Model curve (new)
-    x_axis, curve_model, aurga_model = rga_curve_multiclass(
-        y_labels, prob_matrix, classes_used, n_segments=n_segments
-    )
-
-    # Perfect baseline
-    p_ideal = ideal_prob_matrix(y_labels, classes_used)
-    _, curve_perfect, aurga_perfect = rga_curve_multiclass(
-        y_labels, p_ideal, classes_used, n_segments=n_segments
-    )
-
-    aurga_norm = aurga_model / aurga_perfect if (np.isfinite(aurga_perfect) and aurga_perfect > 0) else np.nan
-
-    if verbose:
-        print(f"RGA Evaluation: {model_name}")
-        print(f"Full RGA: {rga_full:.4f}")
-        print(f"AURGA: {aurga_model:.4f}")
-        print(f"AURGA_perfect: {aurga_perfect:.4f}")
-        print(f"AURGA_normalized_to_perfect: {aurga_norm:.4f}")
-        print(f"\nClass order: {classes_used}")
-        print("\nPer-Class RGA:")
-        for cls, rga_val, w in zip(classes_used, rga_per_class, class_weights):
-            print(f"Class {cls}: RGA={rga_val:.4f}, Weight={w:.4f}")
-
-    if plot:
-        plt.figure(figsize=fig_size)
-        plt.plot(x_axis, curve_model, "-o", linewidth=2.5, markersize=5,
-                 label=f"{model_name} (nAURGA={aurga_norm:.3f})")
-        plt.plot(x_axis, curve_perfect, "--", linewidth=2.0, label='Perfect')
-
-        plt.xlabel('Fraction of Data Removed', fontsize=11, fontweight='bold')
-        plt.ylabel('RGA Score', fontsize=11, fontweight='bold')
-        plt.title('RGA Curve', fontsize=12, fontweight="bold")
-        plt.grid(alpha=0.3, linestyle="--")
-        plt.xlim([0, 1])
-        ymax = np.nanmax([np.nanmax(curve_model), np.nanmax(curve_perfect)])
-        plt.ylim([0, ymax * 1.1 if np.isfinite(ymax) else 1])
-        plt.legend(fontsize=9)
-        plt.tight_layout()
-        if save_path is None:
-            plt.show()
-        else:
-            plt.savefig(save_path, dpi=300, bbox_inches="tight")
-        plt.close()
-
-    return {
-        "rga_full": rga_full,
-        "rga_per_class": rga_per_class,
-        "class_weights": class_weights,
-        "classes": classes_used,
-        "x_axis": x_axis,
-        "curve_model": curve_model,
-        "curve_perfect": curve_perfect,
-        "aurga": aurga_model,
-        "aurga_perfect": aurga_perfect,
-        "aurga_normalized_to_perfect": aurga_norm
+    idx_by_class = {
+        cls: np.where(y_true == cls)[0]
+        for cls in class_order
     }
 
+    for i, frac in enumerate(x_axis):
+        keep_indices = []
 
-def compare_models_rga(models_dict, y_labels, n_segments=10,
-                        fig_size=(14, 6), verbose=True, save_path=None):
-    """
-    Compare multiple models using RGA metrics.
+        for k, cls in enumerate(class_order):
+            idx_cls = idx_by_class[cls]
 
-    Parameters
-    ----------
-    models_dict : dict
-        Dictionary mapping model names to tuples of (prob_matrix, class_order).
-        Example: {
-            'Random Forest': (rf.predict_proba(x_test), rf.classes_),
-            'Neural Network': (nn_probs, np.array([0, 1, 2]))
-        }
-    y_labels : array-like
-        True class labels
-    n_segments : int, optional
-        Number of segments for partial RGA
-    fig_size : tuple, optional
-        Figure size for comparison plot
-    verbose : bool, optional
-        Print detailed comparison
-    save_path :
-        Path for saving the plot
+            if len(idx_cls) == 0:
+                continue
 
-    Returns
-    -------
-    dict
-        Comparison results for all models
+            confidence = prob_matrix[idx_cls, k]
 
-    """
-    results = {}
+            order_cls = idx_cls[np.lexsort((idx_cls, -confidence))]
 
-    for model_name, (p, classes) in models_dict.items():
-        if verbose:
-            print(f"\nEvaluating {model_name}...")
+            n_remove = int(np.floor(frac * len(idx_cls)))
+            keep_cls = order_cls[n_remove:]
 
-        res = evaluate_rga_multiclass(
-            y_labels=y_labels,
-            prob_matrix=p,
-            class_order=classes,
+            keep_indices.append(keep_cls)
+
+        if keep_indices:
+            keep_indices = np.concatenate(keep_indices)
+        else:
+            keep_indices = np.array([], dtype=int)
+
+        if len(keep_indices) < 2:
+            curve[i] = 0.0
+            continue
+
+        y_remaining = y_true[keep_indices]
+        p_remaining = prob_matrix[keep_indices, :]
+
+        score_result = _multiclass_rga_score(
+            y_remaining,
+            p_remaining,
+            class_order=class_order,
+            verbose=verbose
+        )
+
+        value = score_result['rga']
+        curve[i] = float(value) if np.isfinite(value) else 0.0
+
+    curve = fill_nan_tail(curve)
+    aurga_raw = float(aurga_from_curve(curve))
+
+    result = {
+        'task': 'multiclass',
+        'curve_method': 'removal',
+        'rga': full['rga'],
+        'x': x_axis,
+        'curve': curve,
+        'aurga': aurga_raw,
+        'aurga_raw': aurga_raw,
+        'per_class_rga': full['per_class_rga'],
+        'class_weights': full['class_weights'],
+        'classes': class_order
+    }
+
+    if normalize_to_perfect:
+        perfect_probs = ideal_prob_matrix(y_true, class_order)
+
+        perfect_result: dict[str, Any] = _multiclass_rga_curve_removal(
+            y_true,
+            perfect_probs,
+            class_order=class_order,
             n_segments=n_segments,
-            model_name=model_name,
-            plot=False,
-            verbose=verbose,
-            save_path=None
-        )
-        results[model_name] = res
-
-    plt.figure(figsize=fig_size)
-    cmap = plt.get_cmap('tab10')
-    colors = cmap(np.linspace(0, 1, len(results)))
-
-    for (model_name, res), color in zip(results.items(), colors):
-        plt.plot(
-            res['x_axis'], res['curve_model'], '-o',
-            linewidth=2.3, markersize=4.5, color=color,
-            label=f"{model_name} (nAURGA={res['aurga_normalized_to_perfect']:.3f})"
+            normalize_to_perfect=False,
+            verbose=False
         )
 
-    plt.xlabel('Fraction of Data Removed', fontsize=11, fontweight='bold')
-    plt.ylabel('RGA Score', fontsize=11, fontweight='bold')
-    plt.title('RGA Curves Comparison', fontsize=12, fontweight='bold')
-    plt.grid(alpha=0.3, linestyle="--")
-    plt.xlim([0, 1])
-    plt.legend(fontsize=9)
-    plt.tight_layout()
-    if save_path is None:
-        plt.show()
-    else:
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        perfect_curve = perfect_result['curve']
+        perfect_aurga = float(perfect_result['aurga_raw'])
+        aurga_normalized = _safe_normalize_area(aurga_raw, perfect_aurga)
 
-    plt.close()
+        result['perfect_curve'] = perfect_curve
+        result['aurga_perfect'] = perfect_aurga
+        result['aurga'] = aurga_normalized
 
-    if verbose:
-        print("\nRGA Comparison Summary")
-        for name, res in results.items():
-            print(
-                f"{name}: RGA={res['rga_full']:.4f}, "
-                f"AURGA={res['aurga']:.4f}, "
-                f"nAURGA={res['aurga_normalized_to_perfect']:.4f}"
-            )
+    return result
 
-    return results
+
+# ---- Private helpers ----
+def _is_single_rga_result(result):
+    """
+    Check whether a dictionary is a single RGA result.
+    """
+    return isinstance(result, dict) and 'curve' in result and 'x' in result
+
+
+def _curve_label(model_name, result):
+    """
+    Make curve label.
+    """
+    rga = result.get('rga', np.nan)
+    aurga = result.get('aurga', np.nan)
+    method = result.get('curve_method', None)
+
+    if np.isfinite(aurga):
+        return f'{model_name} (RGA={rga:.3f}, AURGA={aurga:.3f}, {method})'
+
+    return f'{model_name} (RGA={rga:.3f}, {method})'
+
+
+def _safe_normalize_area(aurga_raw, aurga_perfect):
+    """
+    Normalize AURGA by the perfect baseline area.
+    """
+    if np.isfinite(aurga_perfect) and aurga_perfect > 0:
+        return float(aurga_raw) / float(aurga_perfect)
+
+    return np.nan
