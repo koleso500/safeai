@@ -20,21 +20,20 @@ plot_rga
 
 Notes
 -----
+Notes
+-----
 The scalar RGA score is computed consistently across binary and multiclass
 classification.
 
 AURGA depends on the curve-construction method.
 
-For binary classification, the default curve method is 'partial', which uses
-partial contribution decomposition over ranked segments. This gives smoother
-and more stable binary RGA curves.
+For binary and multiclass classification, the default curve method is
+'removal'. This progressively removes the most confident samples inside each
+true class and recomputes RGA on the remaining data.
 
-For multiclass classification, the default curve method is 'removal', which
-progressively removes the most confident samples inside each class and
-recomputes weighted one-vs-rest RGA.
-
-Use curve_method='removal' for binary classification if strict curve-procedure
-consistency with multiclass is required.
+The binary 'partial' curve is still available with curve_method='partial'. It
+is useful as a decomposition-style curve, but the removal curve is preferred
+for normalized AURGA.
 """
 
 from typing import Any
@@ -212,7 +211,7 @@ def rga_curve(
         positive_class=positive_class
     )
 
-    resolved_method = _resolve_curve_method(task, curve_method)
+    resolved_method = _resolve_curve_method(curve_method)
 
     if task == 'binary':
         if resolved_method == 'partial':
@@ -631,23 +630,16 @@ def _validate_curve_method(curve_method):
         )
 
 
-def _resolve_curve_method(task, curve_method):
+def _resolve_curve_method(curve_method):
     """
     Resolve automatic curve method.
 
-    Defaults
-    --------
-    binary:
-        'partial'
-
-    multiclass:
-        'removal'
+    By default, both binary and multiclass classification use the removal
+    curve. The binary partial curve remains available explicitly with
+    curve_method='partial'.
     """
     if curve_method != 'auto':
         return curve_method
-
-    if task == 'binary':
-        return 'partial'
 
     return 'removal'
 
@@ -812,10 +804,11 @@ def _binary_rga_curve_removal(
     normalize_to_perfect=True
 ):
     """
-    Binary RGA curve by removal and recomputation.
+    Binary RGA curve by class-wise removal and recomputation.
 
-    This method is available for methodological consistency with multiclass
-    curves, but it may produce less smooth binary curves.
+    This mirrors the multiclass removal logic. At each step, the same fraction
+    of samples is removed inside each true class. This keeps the perfect-model
+    normalization stable.
     """
     y_true, y_score = _clean_binary_inputs(y_true, y_score)
 
@@ -823,23 +816,55 @@ def _binary_rga_curve_removal(
     curve = np.zeros_like(x_axis, dtype=float)
 
     full_rga = _binary_rga_score(y_true, y_score)
-    n = len(y_true)
 
-    if n == 0:
+    classes = np.unique(y_true)
+
+    if len(y_true) == 0 or len(classes) < 2:
         curve[:] = np.nan
         aurga_raw = np.nan
     else:
-        order = np.lexsort((np.arange(n), -y_score))
+        idx_by_class = {
+            cls: np.where(y_true == cls)[0]
+            for cls in classes
+        }
+
+        positive_class = np.max(classes)
 
         for i, frac in enumerate(x_axis):
-            n_remove = int(np.floor(frac * n))
-            keep = order[n_remove:]
+            keep_indices = []
 
-            if len(keep) < 2:
+            for cls in classes:
+                idx_cls = idx_by_class[cls]
+
+                if len(idx_cls) == 0:
+                    continue
+
+                if cls == positive_class:
+                    confidence = y_score[idx_cls]
+                else:
+                    confidence = -y_score[idx_cls]
+
+                order_cls = idx_cls[np.lexsort((idx_cls, -confidence))]
+
+                n_remove = int(np.floor(frac * len(idx_cls)))
+                keep_cls = order_cls[n_remove:]
+
+                keep_indices.append(keep_cls)
+
+            if keep_indices:
+                keep_indices = np.concatenate(keep_indices)
+            else:
+                keep_indices = np.array([], dtype=int)
+
+            if len(keep_indices) < 2 or len(np.unique(y_true[keep_indices])) < 2:
                 curve[i] = 0.0
                 continue
 
-            value = _binary_rga_score(y_true[keep], y_score[keep])
+            value = _binary_rga_score(
+                y_true[keep_indices],
+                y_score[keep_indices]
+            )
+
             curve[i] = float(value) if np.isfinite(value) else 0.0
 
         curve = fill_nan_tail(curve)
