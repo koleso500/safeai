@@ -284,4 +284,34 @@ https://github.com/GolnooshBabaei/safeaipackage
 
 This repository is currently maintained as a separate implementation for development and packaging purposes, but it is expected to be merged or aligned with the original SAFE-AI package in the future.
 
-If you use this package in academic work, please consider citing the related SAFE-AI and RGB paper referenced in the original project.
+## Citation
+
+If you use this package in academic work, please cite the SAFE-AI metrics paper:
+
+```bibtex
+@article{safeaimetrics,
+  title = {{SAFE AI metrics: An integrated approach}},
+  journal = {Machine Learning with Applications},
+  volume = {23},
+  pages = {100821},
+  year = {2026},
+  issn = {2666-8270},
+  doi = {10.1016/j.mlwa.2025.100821},
+  url = {https://www.sciencedirect.com/science/article/pii/S266682702500204X},
+  author = {Giudici, Paolo and Kolesnikov, Vasily}
+}
+```
+
+The package is also related to the Rank Graduation Box framework. Please also consider citing:
+
+```bibtex
+@article{babaei2025rgb,
+  title = {{A Rank Graduation Box for SAFE AI}},
+  journal = {Expert Systems with Applications},
+  volume = {259},
+  pages = {125239},
+  year = {2025},
+  doi = {10.1016/j.eswa.2024.125239},
+  author = {Babaei, Golnoosh and Giudici, Paolo and Raffinetti, Emanuela}
+}
+```
