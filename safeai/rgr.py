@@ -57,7 +57,8 @@ from safeai.utils import (
     rescale_by_rga,
     area_under_normalized_curve,
     nan_to_zero,
-    resolve_class_orders
+    resolve_class_orders,
+    resolve_rng
 )
 
 
@@ -253,7 +254,10 @@ def rgr_curve(
         Name stored in the result dictionary and used in plot labels.
 
     random_seed : int, optional
-        Random seed used for Gaussian noise generation when method='noise'.
+        Random seed used for Gaussian noise generation when method='noise'. Seeds
+        both the NumPy (sklearn) and Torch (pytorch) noise paths. If None, noise
+        is drawn from fresh entropy and is not reproducible; there is no fixed
+        internal default seed.
 
     plot : bool, default=False
         Whether to create a plot for the computed RGR curve.
@@ -534,7 +538,10 @@ def compare_rgr(
         Whether to print progress and summary information.
 
     random_seed : int, optional
-        Random seed used for Gaussian noise generation when method='noise'.
+        Random seed used for Gaussian noise generation when method='noise'. Seeds
+        both the NumPy (sklearn) and Torch (pytorch) noise paths. If None, noise
+        is drawn from fresh entropy and is not reproducible; there is no fixed
+        internal default seed.
 
     save_path : str, optional
         Path where the comparison plot should be saved. If None and show=False,
@@ -911,7 +918,7 @@ def _rgr_curve_noise_core(
         class_order
     )
 
-    rng = np.random.default_rng(random_seed)
+    rng = resolve_rng(random_seed)
     x_input = _prepare_x_for_model(x_data, model_type=model_type)
 
     rgr_scores = []
@@ -1612,7 +1619,10 @@ def _predict_probabilities(model, x_data, *, model_type='sklearn', device=None):
 
 def _add_gaussian_noise(x_data, sigma, *, model_type, rng):
     if model_type == 'pytorch':
-        return x_data + torch.randn_like(x_data) * float(sigma)
+        generator = torch.Generator()
+        generator.manual_seed(int(rng.integers(0, 2 ** 32)))
+        noise = torch.randn(x_data.shape, generator=generator, dtype=x_data.dtype, device='cpu')
+        return x_data + noise.to(x_data.device) * float(sigma)
 
     noise = rng.normal(0.0, float(sigma), size=x_data.shape)
     return x_data + noise
