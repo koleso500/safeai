@@ -32,6 +32,7 @@ __all__ = [
     'area_under_normalized_curve',
     'nan_to_zero',
     'resolve_class_orders',
+    'resolve_rng',
 
     # Feature masking helpers
     'apply_feature_baseline',
@@ -323,6 +324,29 @@ def resolve_class_orders(model, *, model_class_order=None, class_order=None, pro
         class_order = np.asarray(class_order)
 
     return model_class_order, class_order
+
+
+def resolve_rng(random_seed, default_seed=None):
+    """
+    Resolve a seed or Generator into a NumPy Generator.
+
+    Parameters
+    ----------
+    random_seed : None, int, or np.random.Generator
+        If a Generator is passed, it is returned unchanged. If an int is passed,
+        it seeds a new Generator. If None, default_seed is used instead.
+
+    default_seed : int, optional
+        Seed used when random_seed is None. If both are None, the resulting
+        Generator is seeded from fresh entropy and is not reproducible.
+
+    Returns
+    -------
+    np.random.Generator
+    """
+    if isinstance(random_seed, np.random.Generator):
+        return random_seed
+    return np.random.default_rng(random_seed if random_seed is not None else default_seed)
 
 
 # ---- Feature masking helpers ----
@@ -721,10 +745,16 @@ def apply_patch_occlusion(
 ):
     """
     Random patch masking for a batch of images.
+
+    Parameters
+    ----------
+    random_seed : int, optional
+        If set, patch positions are drawn from a local ``random.Random(random_seed)``
+        and the result is reproducible without modifying any global RNG state. If
+        None, positions are drawn from the process-global ``random`` module, so
+        results depend on prior global state and are not reproducible.
     """
-    if random_seed is not None:
-        random.seed(random_seed)
-        torch.manual_seed(random_seed)
+    rng = random.Random(random_seed) if random_seed is not None else random
 
     out = images.clone()
     _, _, h, w = out.shape
@@ -740,8 +770,8 @@ def apply_patch_occlusion(
 
     for i in range(out.shape[0]):
         for _ in range(num_patches):
-            y0 = random.randint(0, h - patch_size)
-            x0 = random.randint(0, w - patch_size)
+            y0 = rng.randint(0, h - patch_size)
+            x0 = rng.randint(0, w - patch_size)
             if baseline == 'blur':
                 out[i, :, y0:y0 + patch_size, x0:x0 + patch_size] = blurred[
                     i, :, y0:y0 + patch_size, x0:x0 + patch_size

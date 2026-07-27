@@ -45,6 +45,7 @@ from safeai.utils import (
     area_under_normalized_curve,
     nan_to_zero,
     resolve_class_orders,
+    resolve_rng,
     apply_feature_baseline,
     mask_columns,
     normalize_rankings
@@ -244,7 +245,10 @@ def rge_curve(
         features are removed one by one.
 
     random_seed : int, optional
-        Random seed used for random masking or occlusion.
+        Random seed used for random masking or occlusion. For random text and
+        tabular feature masking, if None a fixed internal seed (42) is used, so
+        results are reproducible by default. For random image occlusion, if None
+        the process-global RNG is used and results are not reproducible.
 
     mask_value : float, default=0.0
         Constant value used for image patch masking.
@@ -539,6 +543,10 @@ def compare_rge(
 
     random_seed : int, optional
         Random seed used for random image occlusion or random feature masking.
+        For random text and tabular feature masking, if None a fixed internal
+        seed (42) is used, so results are reproducible by default. For random
+        image occlusion, if None the process-global RNG is used and results are
+        not reproducible.
 
     patch_rankings : list or array-like, optional
         Patch rankings used when occlusion_method='gradcam_most'.
@@ -1369,7 +1377,7 @@ def _rge_curve_text_core(
         print(f'Masking: {masking_method} | Baseline: {baseline}')
         print(f'x: {x.shape} | Testing {len(removal_fractions)} removal fractions')
 
-    rng = np.random.default_rng(random_seed if random_seed is not None else 42)
+    rng = resolve_rng(random_seed, default_seed=42)
     feat_mean = np.nanmean(x, axis=0) if baseline == 'mean' else None
 
     if prob_full_cached is None:
@@ -1557,7 +1565,7 @@ def _rge_curve_tabular_core(
     if baseline not in ('zero', 'mean'):
         raise ValueError(f"Unknown baseline: {baseline}. Use 'zero' or 'mean'.")
 
-    rng = np.random.default_rng(random_seed if random_seed is not None else 42)
+    rng = resolve_rng(random_seed, default_seed=42)
     feat_mean = np.nanmean(x, axis=0) if baseline == 'mean' else None
 
     if prob_full_cached is None:
