@@ -83,6 +83,10 @@ def test_unseeded_rge_matches_upstream(tmp_path):
     up = _run_worker(upstream_root, tmp_path / 'upstream.npz')
     new = _run_worker(REPO_ROOT, tmp_path / 'patched.npz')
 
+    # The last point masks every feature, so all reduced predictions tie.
+    # Its value depended on the row order before tied predictions were
+    # averaged in cvm1_concordance_weighted, so it is excluded here.
     for key in ('greedy', 'rand'):
-        assert np.array_equal(up[key], new[key]), f'{key} curve diverged from upstream'
-        assert up[key].tobytes() == new[key].tobytes(), f'{key} curve not bit-identical'
+        up_key, new_key = up[key][:-1], new[key][:-1]
+        assert np.array_equal(up_key, new_key), f'{key} curve diverged from upstream'
+        assert up_key.tobytes() == new_key.tobytes(), f'{key} curve not bit-identical'
