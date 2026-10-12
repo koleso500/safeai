@@ -62,8 +62,8 @@ def concordance_curve(y, yhat):
     if len(y) == 0:
         return np.array([])
 
-    ord_idx = np.argsort(yhat, kind='stable')
-    cum = np.cumsum(y[ord_idx])
+    ord_idx = np.lexsort((y, yhat))
+    cum = np.cumsum(_average_ties(y[ord_idx], yhat[ord_idx]))
     return cum / cum[-1]
 
 
@@ -105,6 +105,13 @@ def cvm1_concordance_weighted(y, yhat):
     -------
     float
         Weighted CvM distance
+
+    Notes
+    -----
+    Observations with tied predictions enter the concordance curve with the
+    mean of their true values, as in the original RGA definition (Agosto,
+    Giudici and Raffinetti, 2020). The result therefore does not depend on
+    the input row order.
     """
     y = np.asarray(y, dtype=float).reshape(-1)
     yhat = np.asarray(yhat, dtype=float).reshape(-1)
@@ -120,11 +127,24 @@ def cvm1_concordance_weighted(y, yhat):
     ord_y = np.argsort(y, kind='stable')
     l = np.cumsum(y[ord_y]) / np.sum(y)
 
-    # Concordance curve
-    ord_yhat = np.argsort(yhat, kind='stable')
-    c = np.cumsum(y[ord_yhat]) / np.sum(y)
+    # Concordance curve (tied predictions share the mean of their y values)
+    ord_yhat = np.lexsort((y, yhat))
+    c = np.cumsum(_average_ties(y[ord_yhat], yhat[ord_yhat])) / np.sum(y)
 
     # Weights
     weights = y[ord_y] / np.sum(y)
 
     return np.sum(np.abs(c - l) * weights)
+
+
+def _average_ties(values, keys):
+    """
+    Replace each value by the mean of the values sharing its key.
+
+    ``keys`` must be sorted. Without ties, ``values`` is returned unchanged.
+    """
+    starts = np.flatnonzero(np.r_[True, keys[1:] != keys[:-1]])
+    if len(starts) == len(keys):
+        return values
+    counts = np.diff(np.r_[starts, len(keys)])
+    return np.repeat(np.add.reduceat(values, starts) / counts, counts)
